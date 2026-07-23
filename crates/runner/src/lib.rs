@@ -26,11 +26,13 @@ pub struct RunnerRequest {
     pub bubblewrap_path: PathBuf,
     pub workspace_path: Option<PathBuf>,
     pub workspace_writable: bool,
+    pub network_enabled: bool,
     pub credential_mounts: Vec<CredentialMount>,
     pub prompt: String,
     pub model: Option<String>,
     pub run_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
+    pub max_output_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,14 +46,6 @@ pub struct CredentialMount {
 enum ControlMessage {
     Start { request: Box<RunnerRequest> },
     Cancel,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerRequest {
-    prompt: String,
-    model: Option<String>,
-    run_timeout_seconds: u64,
-    idle_timeout_seconds: u64,
 }
 
 struct SandboxPaths {
@@ -80,7 +74,7 @@ pub async fn execute(
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("start local runner {}", runner_binary.display()))?;
     let mut stdin = child.stdin.take().context("runner stdin unavailable")?;
@@ -108,21 +102,35 @@ pub async fn execute(
             }
             () = &mut cancel_deadline, if cancelling => {
                 terminate(&mut child).await;
-                events.send(RuntimeEvent::Cancelled).await.context("report forced runner cancellation")?;
+                events.send(RuntimeEvent::Uncertain {
+                    code: "runner_lost".to_owned(),
+                    message: "runner cancellation exceeded its confirmation deadline".to_owned(),
+                }).await.context("report uncertain forced runner cancellation")?;
                 return Ok(());
             }
             line = lines.next_line() => {
                 if let Some(line) = line.context("read runner event")? {
                     let event: RuntimeEvent = serde_json::from_str(&line).context("decode runner event")?;
-                    let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. });
-                    events.send(event).await.context("forward runner event")?;
+                    let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. } | RuntimeEvent::Uncertain { .. });
                     if terminal {
                         let status = timeout(Duration::from_secs(10), child.wait()).await.context("runner exit timeout")??;
                         if !status.success() {
                             warn!(%status, "runner exited non-zero after terminal event");
+                            events
+                                .send(RuntimeEvent::Uncertain {
+                                    code: "runner_lost".to_owned(),
+                                    message: format!(
+                                        "runner exited with {status} after reporting a terminal event"
+                                    ),
+                                })
+                                .await
+                                .context("report abnormal runner exit")?;
+                            return Ok(());
                         }
+                        events.send(event).await.context("forward terminal runner event")?;
                         return Ok(());
                     }
+                    events.send(event).await.context("forward runner event")?;
                 } else {
                     let status = child.wait().await.context("wait for runner")?;
                     bail!("runner exited before a terminal event: {status}");
@@ -158,12 +166,6 @@ pub async fn supervisor() -> Result<()> {
     let mut child = spawn_bubblewrap_worker(&request, &scratch).await?;
     let mut worker_stdin = child.stdin.take().context("worker stdin unavailable")?;
     let worker_stdout = child.stdout.take().context("worker stdout unavailable")?;
-    let worker_request = WorkerRequest {
-        prompt: request.prompt,
-        model: request.model,
-        run_timeout_seconds: request.run_timeout_seconds,
-        idle_timeout_seconds: request.idle_timeout_seconds,
-    };
     write_message(
         &mut worker_stdin,
         &ControlMessage::Start {
@@ -176,11 +178,13 @@ pub async fn supervisor() -> Result<()> {
                 bubblewrap_path: PathBuf::new(),
                 workspace_path: Some(PathBuf::from("/workspace")),
                 workspace_writable: request.workspace_writable,
+                network_enabled: request.network_enabled,
                 credential_mounts: Vec::new(),
-                prompt: worker_request.prompt,
-                model: worker_request.model,
-                run_timeout_seconds: worker_request.run_timeout_seconds,
-                idle_timeout_seconds: worker_request.idle_timeout_seconds,
+                prompt: request.prompt,
+                model: request.model,
+                run_timeout_seconds: request.run_timeout_seconds,
+                idle_timeout_seconds: request.idle_timeout_seconds,
+                max_output_bytes: request.max_output_bytes,
             }),
         },
     )
@@ -245,6 +249,7 @@ pub async fn worker() -> Result<()> {
         model: request.model,
         run_timeout_seconds: request.run_timeout_seconds,
         idle_timeout_seconds: request.idle_timeout_seconds,
+        max_output_bytes: request.max_output_bytes,
     };
     let mut runtime_task = tokio::spawn(async move {
         thieving_eyes_runtime_sandbox_agent::run(runtime_request, cancel_rx, event_tx).await
@@ -261,7 +266,7 @@ pub async fn worker() -> Result<()> {
                 }
             }
             Some(event) = event_rx.recv() => {
-                let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. });
+                let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. } | RuntimeEvent::Uncertain { .. });
                 let encoded = serde_json::to_vec(&event).context("encode runtime event")?;
                 output.write_all(&encoded).await?;
                 output.write_all(b"\n").await?;
@@ -274,7 +279,7 @@ pub async fn worker() -> Result<()> {
             result = &mut runtime_task => {
                 result.context("join runtime task")??;
                 while let Some(event) = event_rx.recv().await {
-                    let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. });
+                    let terminal = matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Cancelled | RuntimeEvent::Failed { .. } | RuntimeEvent::Uncertain { .. });
                     let encoded = serde_json::to_vec(&event).context("encode final runtime event")?;
                     output.write_all(&encoded).await?;
                     output.write_all(b"\n").await?;
@@ -308,7 +313,8 @@ fn stdout_pipe() -> Result<tokio::net::unix::pipe::Sender> {
 async fn spawn_bubblewrap_worker(request: &RunnerRequest, scratch: &TempDir) -> Result<Child> {
     let paths = prepare_sandbox_paths(request, scratch).await?;
     let mut command = Command::new(&request.bubblewrap_path);
-    configure_base_bubblewrap(&mut command, &paths);
+    command.env_clear();
+    configure_base_bubblewrap(&mut command, &paths, request.network_enabled);
 
     if request.workspace_writable {
         command.arg("--bind");
@@ -355,7 +361,7 @@ async fn spawn_bubblewrap_worker(request: &RunnerRequest, scratch: &TempDir) -> 
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     command.spawn().context("start bubblewrap worker")
 }
 
@@ -387,9 +393,16 @@ async fn prepare_sandbox_paths(request: &RunnerRequest, scratch: &TempDir) -> Re
     }
 
     let workspace = if let Some(path) = &request.workspace_path {
-        tokio::fs::canonicalize(path)
+        let canonical = tokio::fs::canonicalize(path)
             .await
-            .with_context(|| format!("canonicalize workspace {}", path.display()))?
+            .with_context(|| format!("canonicalize workspace {}", path.display()))?;
+        if canonical != *path {
+            bail!(
+                "workspace identity changed after submission acceptance: {}",
+                path.display()
+            );
+        }
+        canonical
     } else {
         let path = scratch.path().join("workspace");
         tokio::fs::create_dir_all(&path).await?;
@@ -405,12 +418,15 @@ async fn prepare_sandbox_paths(request: &RunnerRequest, scratch: &TempDir) -> Re
     })
 }
 
-fn configure_base_bubblewrap(command: &mut Command, paths: &SandboxPaths) {
+fn configure_base_bubblewrap(command: &mut Command, paths: &SandboxPaths, network_enabled: bool) {
     command
         .arg("--die-with-parent")
         .arg("--new-session")
-        .arg("--unshare-all")
-        .arg("--share-net")
+        .arg("--unshare-all");
+    if network_enabled {
+        command.arg("--share-net");
+    }
+    command
         .arg("--ro-bind")
         .arg("/usr")
         .arg("/usr")

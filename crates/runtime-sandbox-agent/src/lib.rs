@@ -34,19 +34,55 @@ pub struct RuntimeRunRequest {
     pub model: Option<String>,
     pub run_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
+    pub max_output_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
-    Started { agent_version: Option<String> },
-    MessageDelta { text: String },
-    Tool { title: String, status: String },
-    Plan { data: Value },
-    Usage { data: Value },
-    Completed { output: String },
+    Started {
+        agent_version: Option<String>,
+    },
+    MessageDelta {
+        text: String,
+    },
+    Tool {
+        title: String,
+        status: String,
+    },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    Usage {
+        used: u64,
+        size: u64,
+        cost: Option<UsageCost>,
+    },
+    Completed {
+        output: String,
+    },
     Cancelled,
-    Failed { code: String, message: String },
+    Failed {
+        code: String,
+        message: String,
+    },
+    Uncertain {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    pub priority: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageCost {
+    pub amount: f64,
+    pub currency: String,
 }
 
 /// Installs the pinned Sandbox Agent binary after verifying its digest.
@@ -167,7 +203,7 @@ pub async fn run(
     let base_url = format!("http://127.0.0.1:{port}");
     let mut child = spawn_server(&request.sandbox_agent_path, port, &token)?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
         .build()
         .context("build runtime HTTP client")?;
 
@@ -199,7 +235,7 @@ pub async fn run(
     }
     if let Err(error) = result {
         let _ = events
-            .send(RuntimeEvent::Failed {
+            .send(RuntimeEvent::Uncertain {
                 code: classify_error(&error).to_owned(),
                 message: error.to_string(),
             })
@@ -217,7 +253,19 @@ async fn run_inner(
     cancel: &mut watch::Receiver<bool>,
     events: &mpsc::Sender<RuntimeEvent>,
 ) -> Result<()> {
-    let session = prepare_session(request, client, base_url, token, events).await?;
+    let session = match prepare_session(request, client, base_url, token, events).await {
+        Ok(session) => session,
+        Err(error) => {
+            events
+                .send(RuntimeEvent::Failed {
+                    code: classify_error(&error).to_owned(),
+                    message: error.to_string(),
+                })
+                .await
+                .context("report runtime preparation failure")?;
+            return Ok(());
+        }
+    };
     drive_prompt(request, client, token, cancel, events, session).await
 }
 
@@ -251,7 +299,7 @@ async fn prepare_session(
 
     let server_id = format!("eyes-{}", Ulid::new());
     let acp_url = format!("{base_url}/v1/acp/{server_id}");
-    rpc(
+    control_rpc(
         client,
         &format!("{acp_url}?agent=opencode"),
         token,
@@ -264,14 +312,10 @@ async fn prepare_session(
     )
     .await?;
 
-    let (sse_tx, sse_rx) = mpsc::channel::<Value>(256);
-    let sse_client = client.clone();
-    let sse_url = acp_url.clone();
-    let sse_token = token.to_owned();
-    let sse_task =
-        tokio::spawn(async move { stream_sse(sse_client, sse_url, sse_token, sse_tx).await });
+    let (sse_rx, sse_task) =
+        subscribe_sse(client.clone(), acp_url.clone(), token.to_owned()).await?;
 
-    let session_response = rpc(
+    let session_response = control_rpc(
         client,
         &acp_url,
         token,
@@ -290,7 +334,7 @@ async fn prepare_session(
         .to_owned();
 
     if let Some(model) = request.model.as_deref().filter(|model| !model.is_empty()) {
-        let _ = rpc(
+        control_rpc(
             client,
             &acp_url,
             token,
@@ -299,7 +343,8 @@ async fn prepare_session(
                 "params": {"sessionId": session_id, "configId": "model", "value": model}
             }),
         )
-        .await;
+        .await
+        .context("set requested OpenCode model")?;
     }
 
     Ok(ActiveSession {
@@ -324,7 +369,7 @@ async fn drive_prompt(
     let prompt_session = session.session_id.clone();
     let prompt_text = request.prompt.clone();
     let mut prompt_task = tokio::spawn(async move {
-        rpc(
+        post_prompt(
             &prompt_client,
             &prompt_url,
             &prompt_token,
@@ -335,7 +380,7 @@ async fn drive_prompt(
         )
         .await
     });
-    let mut prompt_finished = false;
+    let mut prompt_post_finished = false;
 
     let run_deadline = sleep(Duration::from_secs(request.run_timeout_seconds.max(1)));
     tokio::pin!(run_deadline);
@@ -347,71 +392,173 @@ async fn drive_prompt(
             biased;
             changed = cancel.changed() => {
                 if changed.is_ok() && *cancel.borrow() {
-                    let _ = cancel_session(client, &session.acp_url, token, &session.session_id, 5).await;
-                    break RuntimeEvent::Cancelled;
-                }
-            }
-            () = &mut run_deadline => {
-                let _ = cancel_session(client, &session.acp_url, token, &session.session_id, 6).await;
-                break RuntimeEvent::Failed { code: "timeout".to_owned(), message: "run timeout elapsed".to_owned() };
-            }
-            () = &mut idle => {
-                let _ = cancel_session(client, &session.acp_url, token, &session.session_id, 7).await;
-                break RuntimeEvent::Failed { code: "timeout".to_owned(), message: "idle timeout elapsed".to_owned() };
-            }
-            Some(value) = session.sse_rx.recv() => {
-                idle.as_mut().reset(Instant::now() + Duration::from_secs(request.idle_timeout_seconds.max(1)));
-                handle_inbound(client, token, events, &session.acp_url, &value, &mut output).await?;
-                if is_business_question(&value) {
-                    break RuntimeEvent::Failed {
-                        code: "interaction_required".to_owned(),
-                        message: "agent requested interactive business input".to_owned(),
+                    break match cancel_session(client, &session.acp_url, token, &session.session_id).await {
+                        Ok(()) => match wait_for_prompt_response(
+                            client,
+                            token,
+                            events,
+                            &mut session,
+                            &mut output,
+                            request.max_output_bytes,
+                            Duration::from_secs(10),
+                        ).await {
+                            Ok(_) => RuntimeEvent::Cancelled,
+                            Err(error) => RuntimeEvent::Uncertain {
+                                code: "cancellation_unconfirmed".to_owned(),
+                                message: format!("Agent did not confirm cancellation: {error}"),
+                            },
+                        }
+                        Err(error) => RuntimeEvent::Uncertain {
+                            code: "cancellation_unconfirmed".to_owned(),
+                            message: format!("could not deliver Agent cancellation: {error}"),
+                        },
                     };
                 }
             }
-            response = &mut prompt_task => {
-                prompt_finished = true;
+            () = &mut run_deadline => {
+                break match cancel_session(client, &session.acp_url, token, &session.session_id).await {
+                    Ok(()) => match wait_for_prompt_response(
+                        client,
+                        token,
+                        events,
+                        &mut session,
+                        &mut output,
+                        request.max_output_bytes,
+                        Duration::from_secs(10),
+                    ).await {
+                        Ok(_) => RuntimeEvent::Failed { code: "timeout".to_owned(), message: "run timeout elapsed".to_owned() },
+                        Err(_) => RuntimeEvent::Uncertain {
+                            code: "timeout_unconfirmed".to_owned(),
+                            message: "run timeout elapsed and Agent stop was not confirmed".to_owned(),
+                        },
+                    },
+                    Err(error) => RuntimeEvent::Uncertain {
+                        code: "timeout_unconfirmed".to_owned(),
+                        message: format!("run timeout elapsed and cancellation was not confirmed: {error}"),
+                    },
+                };
+            }
+            () = &mut idle => {
+                break match cancel_session(client, &session.acp_url, token, &session.session_id).await {
+                    Ok(()) => match wait_for_prompt_response(
+                        client,
+                        token,
+                        events,
+                        &mut session,
+                        &mut output,
+                        request.max_output_bytes,
+                        Duration::from_secs(10),
+                    ).await {
+                        Ok(_) => RuntimeEvent::Failed { code: "timeout".to_owned(), message: "idle timeout elapsed".to_owned() },
+                        Err(_) => RuntimeEvent::Uncertain {
+                            code: "timeout_unconfirmed".to_owned(),
+                            message: "idle timeout elapsed and Agent stop was not confirmed".to_owned(),
+                        },
+                    },
+                    Err(error) => RuntimeEvent::Uncertain {
+                        code: "timeout_unconfirmed".to_owned(),
+                        message: format!("idle timeout elapsed and cancellation was not confirmed: {error}"),
+                    },
+                };
+            }
+            value = session.sse_rx.recv() => {
+                match value {
+                    Some(value) => {
+                        idle.as_mut().reset(Instant::now() + Duration::from_secs(request.idle_timeout_seconds.max(1)));
+                        if is_response_for(&value, 4) {
+                            break completion_from_response(&value, output);
+                        }
+                        handle_inbound(
+                            client,
+                            token,
+                            events,
+                            &session.acp_url,
+                            &value,
+                            &mut output,
+                            request.max_output_bytes,
+                        )
+                        .await?;
+                        if is_business_question(&value) {
+                            break RuntimeEvent::Failed {
+                                code: "interaction_required".to_owned(),
+                                message: "agent requested interactive business input".to_owned(),
+                            };
+                        }
+                    }
+                    None => {
+                        break RuntimeEvent::Uncertain {
+                            code: "runtime_stream_lost".to_owned(),
+                            message: "Sandbox Agent event stream closed before prompt completion".to_owned(),
+                        };
+                    }
+                }
+            }
+            result = &mut session.sse_task => {
+                let message = match result {
+                    Ok(Ok(())) => "Sandbox Agent event stream ended before prompt completion".to_owned(),
+                    Ok(Err(error)) => format!("Sandbox Agent event stream failed: {error}"),
+                    Err(error) => format!("Sandbox Agent event task failed: {error}"),
+                };
+                break RuntimeEvent::Uncertain {
+                    code: "runtime_stream_lost".to_owned(),
+                    message,
+                };
+            }
+            response = &mut prompt_task, if !prompt_post_finished => {
+                prompt_post_finished = true;
                 let response = response.context("join ACP prompt task")??;
-                break completion_from_response(&response, output);
+                if response
+                    .as_ref()
+                    .is_some_and(|response| !is_response_for(response, 4))
+                {
+                    bail!("ACP prompt POST returned an unrelated response envelope");
+                }
             }
         }
     };
 
-    if !prompt_finished {
+    if !prompt_post_finished {
         prompt_task.abort();
         let _ = prompt_task.await;
     }
     session.sse_task.abort();
     let _ = session.sse_task.await;
-    let _ = authorized(client.delete(&session.acp_url), token)
-        .send()
-        .await;
     events
         .send(completion)
         .await
         .context("report runtime completion")?;
+    // DELETE asks Sandbox Agent to shut down the underlying Agent process. It
+    // is only best-effort here: the outer runtime owner kills and reaps the
+    // dedicated Sandbox Agent process, while the runner withholds the terminal
+    // event until the sandbox worker has exited.
+    let _ = timeout(
+        Duration::from_secs(2),
+        authorized(client.delete(&session.acp_url), token).send(),
+    )
+    .await;
     Ok(())
 }
 
-async fn cancel_session(
-    client: &Client,
-    url: &str,
-    token: &str,
-    session_id: &str,
-    request_id: u64,
-) -> Result<Value> {
-    rpc(
-        client,
-        url,
-        token,
-        json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "session/cancel",
-            "params": {"sessionId": session_id}
-        }),
+async fn cancel_session(client: &Client, url: &str, token: &str, session_id: &str) -> Result<()> {
+    let response = timeout(
+        Duration::from_secs(10),
+        authorized(
+            client.post(url).json(&json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            })),
+            token,
+        )
+        .send(),
     )
     .await
+    .context("ACP cancellation delivery timeout")?
+    .context("deliver ACP cancellation")?;
+    if !response.status().is_success() {
+        bail!("ACP cancellation failed with {}", response.status());
+    }
+    Ok(())
 }
 
 async fn handle_inbound(
@@ -421,10 +568,15 @@ async fn handle_inbound(
     acp_url: &str,
     value: &Value,
     output: &mut String,
+    max_output_bytes: usize,
 ) -> Result<()> {
-    if let Some(event) = normalize_event(value) {
-        if let RuntimeEvent::MessageDelta { text } = &event {
+    if let Some(mut event) = normalize_event(value) {
+        if let RuntimeEvent::MessageDelta { text } = &mut event {
+            truncate_to_bytes(text, max_output_bytes.saturating_sub(output.len()));
             output.push_str(text);
+            if text.is_empty() {
+                return Ok(());
+            }
         }
         events.send(event).await.context("report runtime event")?;
     }
@@ -434,7 +586,24 @@ async fn handle_inbound(
     Ok(())
 }
 
+fn truncate_to_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
 fn completion_from_response(response: &Value, output: String) -> RuntimeEvent {
+    if let Some(error) = response.get("error") {
+        return RuntimeEvent::Failed {
+            code: "provider_error".to_owned(),
+            message: format!("Agent prompt failed: {}", truncate(&error.to_string(), 512)),
+        };
+    }
     let stop_reason = response
         .pointer("/result/stopReason")
         .and_then(Value::as_str)
@@ -484,31 +653,151 @@ async fn rpc(client: &Client, url: &str, token: &str, payload: Value) -> Result<
     Ok(value)
 }
 
-async fn stream_sse(
+async fn post_prompt(
+    client: &Client,
+    url: &str,
+    token: &str,
+    payload: Value,
+) -> Result<Option<Value>> {
+    let response = authorized(client.post(url).json(&payload), token)
+        .send()
+        .await
+        .with_context(|| format!("send ACP prompt to {url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("ACP prompt failed with {status}: {}", truncate(&body, 512));
+    }
+    let body = response.text().await.context("read ACP prompt response")?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(&body).context("decode ACP prompt response")?;
+    Ok(Some(value))
+}
+
+async fn wait_for_prompt_response(
+    client: &Client,
+    token: &str,
+    events: &mpsc::Sender<RuntimeEvent>,
+    session: &mut ActiveSession,
+    output: &mut String,
+    max_output_bytes: usize,
+    deadline: Duration,
+) -> Result<Value> {
+    timeout(deadline, async {
+        loop {
+            tokio::select! {
+                value = session.sse_rx.recv() => {
+                    let value = value.context("Sandbox Agent event stream closed")?;
+                    if is_response_for(&value, 4) {
+                        return Ok(value);
+                    }
+                    handle_inbound(
+                        client,
+                        token,
+                        events,
+                        &session.acp_url,
+                        &value,
+                        output,
+                        max_output_bytes,
+                    )
+                    .await?;
+                }
+                result = &mut session.sse_task => {
+                    result.context("join Sandbox Agent event stream")??;
+                    bail!("Sandbox Agent event stream ended");
+                }
+            }
+        }
+    })
+    .await
+    .context("Agent stop confirmation timeout")?
+}
+
+fn is_response_for(value: &Value, request_id: u64) -> bool {
+    value.get("method").is_none()
+        && value.get("id").and_then(Value::as_u64) == Some(request_id)
+        && (value.get("result").is_some() || value.get("error").is_some())
+}
+
+async fn control_rpc(client: &Client, url: &str, token: &str, payload: Value) -> Result<Value> {
+    timeout(Duration::from_secs(30), rpc(client, url, token, payload))
+        .await
+        .context("ACP control request timeout")?
+}
+
+async fn subscribe_sse(
     client: Client,
     url: String,
     token: String,
-    tx: mpsc::Sender<Value>,
-) -> Result<()> {
-    let response = authorized(client.get(&url), &token)
-        .send()
+) -> Result<(mpsc::Receiver<Value>, tokio::task::JoinHandle<Result<()>>)> {
+    let first_response = open_sse(&client, &url, &token, None).await?;
+    let (tx, rx) = mpsc::channel(256);
+    let task = tokio::spawn(async move {
+        let mut response = Some(first_response);
+        let mut last_event_id = None;
+        loop {
+            let current = match response.take() {
+                Some(response) => response,
+                None => match open_sse(&client, &url, &token, last_event_id).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        debug!(%error, "reconnect ACP SSE failed");
+                        sleep(Duration::from_millis(150)).await;
+                        continue;
+                    }
+                },
+            };
+            let mut stream = current.bytes_stream().eventsource();
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        debug!(%error, "ACP SSE stream interrupted");
+                        break;
+                    }
+                };
+                if event.data.is_empty() {
+                    continue;
+                }
+                let event_id = event.id.parse::<u64>().ok();
+                if event_id.is_some_and(|id| last_event_id.is_some_and(|last| id <= last)) {
+                    continue;
+                }
+                let value: Value =
+                    serde_json::from_str(&event.data).context("decode ACP SSE payload")?;
+                if tx.send(value).await.is_err() {
+                    return Ok(());
+                }
+                if let Some(event_id) = event_id {
+                    last_event_id = Some(event_id);
+                }
+            }
+            sleep(Duration::from_millis(150)).await;
+        }
+    });
+    Ok((rx, task))
+}
+
+async fn open_sse(
+    client: &Client,
+    url: &str,
+    token: &str,
+    last_event_id: Option<u64>,
+) -> Result<reqwest::Response> {
+    let mut request = authorized(client.get(url), token);
+    if let Some(last_event_id) = last_event_id {
+        request = request.header("Last-Event-ID", last_event_id.to_string());
+    }
+    let response = timeout(Duration::from_secs(10), request.send())
         .await
+        .context("ACP SSE subscription timeout")?
         .context("subscribe to ACP SSE")?;
     if response.status() != StatusCode::OK {
         bail!("ACP SSE returned {}", response.status());
     }
-    let mut stream = response.bytes_stream().eventsource();
-    while let Some(event) = stream.next().await {
-        let event = event.context("read ACP SSE event")?;
-        if event.data.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&event.data).context("decode ACP SSE payload")?;
-        if tx.send(value).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
+    Ok(response)
 }
 
 fn normalize_event(value: &Value) -> Option<RuntimeEvent> {
@@ -537,10 +826,35 @@ fn normalize_event(value: &Value) -> Option<RuntimeEvent> {
                 .to_owned(),
         }),
         "plan" => Some(RuntimeEvent::Plan {
-            data: update.clone(),
+            entries: update
+                .get("entries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    Some(PlanEntry {
+                        content: entry.get("content")?.as_str()?.to_owned(),
+                        priority: entry
+                            .get("priority")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        status: entry
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                })
+                .collect(),
         }),
         "usage_update" => Some(RuntimeEvent::Usage {
-            data: update.clone(),
+            used: update.get("used")?.as_u64()?,
+            size: update.get("size")?.as_u64()?,
+            cost: update.get("cost").and_then(|cost| {
+                Some(UsageCost {
+                    amount: cost.get("amount")?.as_f64()?,
+                    currency: cost.get("currency")?.as_str()?.to_owned(),
+                })
+            }),
         }),
         _ => None,
     }
@@ -733,5 +1047,45 @@ mod tests {
             completion_from_response(&response, String::new()),
             RuntimeEvent::Failed { code, .. } if code == "provider_error"
         ));
+
+        let response = json!({"id": 4, "error": {"code": -32000, "message": "failed"}});
+        assert!(matches!(
+            completion_from_response(&response, String::new()),
+            RuntimeEvent::Failed { code, message }
+                if code == "provider_error" && message.contains("failed")
+        ));
+    }
+
+    #[test]
+    fn prompt_response_is_recognized_on_sse() {
+        assert!(is_response_for(
+            &json!({"jsonrpc": "2.0", "id": 4, "result": {"stopReason": "end_turn"}}),
+            4
+        ));
+        assert!(is_response_for(
+            &json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -1}}),
+            4
+        ));
+        assert!(!is_response_for(
+            &json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+            4
+        ));
+        assert!(!is_response_for(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/update"}),
+            4
+        ));
+    }
+
+    #[test]
+    fn captured_output_is_bounded_on_utf8_boundary() {
+        let mut output = String::new();
+        let mut first = "你好世界".to_owned();
+        truncate_to_bytes(&mut first, 7);
+        output.push_str(&first);
+        assert_eq!(output, "你好");
+        let mut second = "xyz".to_owned();
+        truncate_to_bytes(&mut second, 7_usize.saturating_sub(output.len()));
+        output.push_str(&second);
+        assert_eq!(output, "你好x");
     }
 }

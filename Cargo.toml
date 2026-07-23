@@ -18,12 +18,14 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+async-stream = "0.3.6"
 axum = { version = "0.8.7", features = ["json", "macros"] }
 bytes = "1.11.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive"] }
 eventsource-stream = "0.2.3"
 futures = "0.3.31"
+fs2 = "0.4.3"
 hex = "0.4.3"
 http = "1.4.0"
 http-body-util = "0.1.3"

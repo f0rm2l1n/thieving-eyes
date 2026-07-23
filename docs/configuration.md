@@ -25,6 +25,8 @@ v1 使用 TOML 配置文件，不提供第二套数据库配置 UI。个人模�
 
 Profile 分开定义 Agent 层审批与系统层隔离。推荐默认值是 `interaction_mode=non_interactive`、`approval_mode=auto_allow`、`sandbox_mode=required`、`escape_behavior=deny`：sandbox 建立后，Agent 在边界内无需逐项确认；越界操作直接拒绝。`approval_mode=auto_allow` 不得隐式关闭或放宽 sandbox。
 
+`0.1` 的本机 Profile 将 `network` 限定为 `inherited` 或 `none`。`none` 保留 worker 与 Sandbox Agent 共享的隔离 loopback namespace，但不共享宿主网络；runner 必须清空宿主进程环境后再显式建立 Agent 环境。
+
 这些字段属于管理员配置，不进入 Submission。provider-specific `yolo`、`bypass` 或 approval flag 只能由 runtime adapter 根据冻结的 Profile 映射，调用方不能直接注入。无隔离的宿主机自动批准若被部署者启用，必须位于独立的高风险 Profile，不能成为默认值或由普通 client 选择。
 
 ## 简单配置

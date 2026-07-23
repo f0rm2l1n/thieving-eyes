@@ -18,8 +18,9 @@ use thieving_eyes_protocol::{
 };
 use thieving_eyes_service::config::{
     CapacityMonitorConfig, Config, CredentialFile, DaemonConfig, Defaults, LocalRunnerConfig,
-    PolicyConfig, ProfileConfig, RouteConfig, RuntimeConfig, SourceConfig, WorkspaceRootConfig,
-    default_config_path, default_data_dir, default_runtime_dir, default_state_dir,
+    NetworkMode, PolicyConfig, ProfileConfig, RouteConfig, RuntimeConfig, SourceConfig,
+    WorkspaceRootConfig, default_config_path, default_data_dir, default_runtime_dir,
+    default_state_dir,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -143,7 +144,7 @@ async fn main() -> Result<()> {
         }
         Command::Cancel { submission_id } => {
             let config = Config::load(&config_path).await?;
-            let (_, body) = request(
+            let (status, body) = request(
                 &config,
                 Method::POST,
                 &format!("/v1/submissions/{submission_id}/cancel"),
@@ -151,6 +152,7 @@ async fn main() -> Result<()> {
                 &[],
             )
             .await?;
+            ensure_success(status, &body)?;
             println!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
@@ -235,7 +237,7 @@ async fn init(
             id: "local_coding".to_owned(),
             version: "1".to_owned(),
             description: "Non-interactive OpenCode in required bubblewrap sandbox".to_owned(),
-            network: "inherited".to_owned(),
+            network: NetworkMode::Inherited,
         }],
         policies: vec![PolicyConfig {
             id: "standard".to_owned(),
@@ -283,7 +285,7 @@ async fn init(
         tokio::fs::rename(config_path, backup).await?;
     }
     tokio::fs::rename(temporary, config_path).await?;
-    thieving_eyes_service::prepare(&config).await?;
+    thieving_eyes_service::install_runtime(&config).await?;
     println!("initialized {}", config_path.display());
     println!("run `eyes doctor` before starting thieving-eyesd");
     Ok(())
@@ -293,7 +295,6 @@ async fn doctor(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path).await?;
     check_private(config_path).await?;
     thieving_eyes_service::prepare(&config).await?;
-    thieving_eyes_runtime_digest(&config).await?;
     if digest_file(&config.local_runner.opencode_binary).await?
         != config.local_runner.opencode_sha256
     {
@@ -587,14 +588,6 @@ async fn digest_file(path: &Path) -> Result<String> {
         "{:x}",
         Sha256::digest(tokio::fs::read(path).await?)
     ))
-}
-
-async fn thieving_eyes_runtime_digest(config: &Config) -> Result<()> {
-    thieving_eyes_runtime_sandbox_agent::verify_sha256(
-        &config.sandbox_agent_path(),
-        thieving_eyes_service::config::SANDBOX_AGENT_SHA256,
-    )
-    .await
 }
 
 #[cfg(unix)]

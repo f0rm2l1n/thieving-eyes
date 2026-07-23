@@ -14,6 +14,8 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
+use crate::config::{PolicyConfig, ProfileConfig, RouteConfig};
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("resource not found")]
@@ -26,6 +28,8 @@ pub enum StoreError {
     NotQueued,
     #[error("workspace has an active writable attempt")]
     WorkspaceBusy,
+    #[error("invalid scheduling constraints")]
+    InvalidScheduling,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -46,6 +50,9 @@ pub struct QueuedSubmission {
     pub start_deadline: Option<DateTime<Utc>>,
     pub workspace_key: Option<String>,
     pub workspace_access: Option<String>,
+    pub profile: ProfileConfig,
+    pub policy: PolicyConfig,
+    pub routes: Vec<RouteConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +79,9 @@ pub struct AcceptSpec {
     pub policy: ResourceRef,
     pub workspace_key: Option<String>,
     pub workspace_access: Option<String>,
+    pub profile_config: ProfileConfig,
+    pub policy_config: PolicyConfig,
+    pub routes: Vec<RouteConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +126,52 @@ impl Store {
         self.events_tx.subscribe()
     }
 
+    pub async fn idempotent_replay(
+        &self,
+        client_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+    ) -> Result<Option<SubmissionAccepted>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT submission_id, request_digest, resolved_profile_json,
+                      resolved_policy_json
+               FROM submissions
+               WHERE client_id = ? AND idempotency_key = ?"#,
+        )
+        .bind(client_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row
+            .try_get::<String, _>("request_digest")
+            .map_err(internal)?
+            != request_digest
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let submission_id = row.try_get("submission_id").map_err(internal)?;
+        let profile = from_json(
+            &row.try_get::<String, _>("resolved_profile_json")
+                .map_err(internal)?,
+        )?;
+        let policy = from_json(
+            &row.try_get::<String, _>("resolved_policy_json")
+                .map_err(internal)?,
+        )?;
+        Ok(Some(accepted_response(
+            submission_id,
+            1,
+            request_digest.to_owned(),
+            profile,
+            policy,
+            true,
+        )))
+    }
+
     pub async fn accept(&self, spec: AcceptSpec) -> Result<AcceptedRecord, StoreError> {
         let AcceptSpec {
             client_id,
@@ -126,10 +182,13 @@ impl Store {
             policy,
             workspace_key,
             workspace_access,
+            profile_config,
+            policy_config,
+            routes,
         } = spec;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         if let Some(row) = sqlx::query(
-            "SELECT submission_id, request_digest, revision FROM submissions WHERE client_id = ? AND idempotency_key = ?",
+            "SELECT submission_id, request_digest, resolved_profile_json, resolved_policy_json FROM submissions WHERE client_id = ? AND idempotency_key = ?",
         )
         .bind(&client_id)
         .bind(&idempotency_key)
@@ -142,16 +201,18 @@ impl Store {
                 return Err(StoreError::IdempotencyConflict);
             }
             let submission_id: String = row.try_get("submission_id").map_err(internal)?;
-            let revision = u64::try_from(row.try_get::<i64, _>("revision").map_err(internal)?)
-                .map_err(|error| internal(anyhow::Error::from(error)))?;
+            let frozen_profile: ResourceRef =
+                from_json(&row.try_get::<String, _>("resolved_profile_json").map_err(internal)?)?;
+            let frozen_policy: ResourceRef =
+                from_json(&row.try_get::<String, _>("resolved_policy_json").map_err(internal)?)?;
             tx.commit().await.map_err(internal)?;
             return Ok(AcceptedRecord {
                 response: accepted_response(
                     submission_id,
-                    revision,
+                    1,
                     request_digest,
-                    profile,
-                    policy,
+                    frozen_profile,
+                    frozen_policy,
                     true,
                 ),
                 replay: true,
@@ -177,8 +238,10 @@ impl Store {
             r#"INSERT INTO submissions (
                 submission_id, client_id, idempotency_key, request_digest, request_json,
                 resolved_profile_json, resolved_policy_json, state, revision, mode, priority,
-                not_before, start_deadline, workspace_key, workspace_access, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                not_before, start_deadline, workspace_key, workspace_access,
+                resolved_profile_config_json, resolved_policy_config_json, resolved_routes_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&submission_id)
         .bind(&client_id)
@@ -193,6 +256,9 @@ impl Store {
         .bind(start_deadline.map(|value| value.to_rfc3339()))
         .bind(workspace_key.as_deref())
         .bind(workspace_access.as_deref())
+        .bind(to_json(&profile_config)?)
+        .bind(to_json(&policy_config)?)
+        .bind(to_json(&routes)?)
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
@@ -255,7 +321,9 @@ impl Store {
     pub async fn queued(&self) -> Result<Vec<QueuedSubmission>, StoreError> {
         let rows = sqlx::query(
             r#"SELECT submission_id, request_json, priority, created_at, not_before,
-                      start_deadline, workspace_key, workspace_access
+                      start_deadline, workspace_key, workspace_access,
+                      resolved_profile_config_json, resolved_policy_config_json,
+                      resolved_routes_json
                FROM submissions WHERE state = 'queued'
                ORDER BY priority DESC, created_at ASC"#,
         )
@@ -267,7 +335,7 @@ impl Store {
 
     pub async fn active_for_source(&self, source_id: &str) -> Result<u32, StoreError> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM attempts WHERE source_id = ? AND state IN ('starting', 'running')",
+            "SELECT COUNT(*) FROM attempts WHERE source_id = ? AND capacity_held = 1",
         )
         .bind(source_id)
         .fetch_one(&self.pool)
@@ -292,16 +360,16 @@ impl Store {
         }
         let workspace_key: Option<String> = row.try_get("workspace_key").map_err(internal)?;
         let workspace_access: Option<String> = row.try_get("workspace_access").map_err(internal)?;
-        if workspace_access.as_deref() == Some("writable")
-            && let Some(key) = workspace_key
-        {
+        if let Some(key) = workspace_key {
             let busy: i64 = sqlx::query_scalar(
                 r#"SELECT COUNT(*) FROM submissions
-                   WHERE workspace_key = ? AND workspace_access = 'writable'
-                     AND state = 'running' AND submission_id <> ?"#,
+                   WHERE workspace_key = ? AND state IN ('running', 'uncertain')
+                     AND submission_id <> ?
+                     AND (workspace_access = 'writable' OR ? = 'writable')"#,
             )
             .bind(key)
             .bind(&spec.submission_id)
+            .bind(workspace_access.as_deref())
             .fetch_one(&mut *tx)
             .await
             .map_err(internal)?;
@@ -339,14 +407,17 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
-        sqlx::query(
-            "UPDATE submissions SET state = 'running', blocker_code = NULL, blocker_detail = NULL, revision = revision + 1, updated_at = ? WHERE submission_id = ?",
+        let updated = sqlx::query(
+            "UPDATE submissions SET state = 'running', blocker_code = NULL, blocker_detail = NULL, revision = revision + 1, updated_at = ? WHERE submission_id = ? AND state = 'queued'",
         )
         .bind(now.to_rfc3339())
         .bind(&spec.submission_id)
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::NotQueued);
+        }
         let event = append_event_tx(
             &mut tx,
             &spec.submission_id,
@@ -373,15 +444,22 @@ impl Store {
         &self,
         submission_id: &str,
         attempt_id: &str,
+        agent_version: Option<&str>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        sqlx::query(
-            "UPDATE attempts SET state = 'running' WHERE attempt_id = ? AND state = 'starting'",
+        let updated = sqlx::query(
+            "UPDATE attempts SET state = 'running', agent_version = ? WHERE attempt_id = ? AND submission_id = ? AND state = 'starting'",
         )
+        .bind(agent_version)
         .bind(attempt_id)
+        .bind(submission_id)
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.map_err(internal)?;
+            return Ok(());
+        }
         let event = append_event_tx(
             &mut tx,
             submission_id,
@@ -424,23 +502,18 @@ impl Store {
             SubmissionState::Completed => "completed",
             SubmissionState::Cancelled => "cancelled",
             SubmissionState::Uncertain => "uncertain",
-            _ => "failed",
+            SubmissionState::Failed => "failed",
+            _ => {
+                return Err(internal(anyhow::anyhow!(
+                    "finish requires a terminal running-state outcome"
+                )));
+            }
         };
+        let capacity_held = i64::from(state == SubmissionState::Uncertain);
         let state_name = state_name(state);
         let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        sqlx::query(
-            "UPDATE attempts SET state = ?, finished_at = ?, error_json = ?, agent_version = ? WHERE attempt_id = ?",
-        )
-        .bind(attempt_state)
-        .bind(now.to_rfc3339())
-        .bind(error.as_ref().map(to_json).transpose()?)
-        .bind(agent_version.as_deref())
-        .bind(&attempt_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-        sqlx::query(
+        let submission_update = sqlx::query(
             r#"UPDATE submissions SET state = ?, revision = revision + 1, result_text = ?,
                result_truncated = ?, error_json = ?, updated_at = ?, finished_at = ?
                WHERE submission_id = ? AND state = 'running'"#,
@@ -455,6 +528,31 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if submission_update.rows_affected() != 1 {
+            tx.rollback().await.map_err(internal)?;
+            return Err(StoreError::NotQueued);
+        }
+        let attempt_update = sqlx::query(
+            r#"UPDATE attempts SET state = ?, finished_at = ?, error_json = ?,
+               agent_version = COALESCE(?, agent_version), capacity_held = ?
+               WHERE attempt_id = ? AND submission_id = ?
+                 AND state IN ('starting', 'running')"#,
+        )
+        .bind(attempt_state)
+        .bind(now.to_rfc3339())
+        .bind(error.as_ref().map(to_json).transpose()?)
+        .bind(agent_version.as_deref())
+        .bind(capacity_held)
+        .bind(&attempt_id)
+        .bind(&submission_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if attempt_update.rows_affected() != 1 {
+            return Err(internal(anyhow::anyhow!(
+                "active submission does not own the expected active attempt"
+            )));
+        }
         let attempt_event = append_event_tx(
             &mut tx,
             &submission_id,
@@ -483,21 +581,23 @@ impl Store {
         code: &str,
         detail: Option<&str>,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
         let current: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT blocker_code, blocker_detail FROM submissions WHERE submission_id = ? AND state = 'queued'",
         )
         .bind(submission_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(internal)?;
         let Some((old_code, old_detail)) = current else {
+            tx.commit().await.map_err(internal)?;
             return Ok(());
         };
         if old_code.as_deref() == Some(code) && old_detail.as_deref() == detail {
+            tx.commit().await.map_err(internal)?;
             return Ok(());
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
-        sqlx::query(
+        let update = sqlx::query(
             "UPDATE submissions SET blocker_code = ?, blocker_detail = ?, revision = revision + 1, updated_at = ? WHERE submission_id = ? AND state = 'queued'",
         )
         .bind(code)
@@ -507,6 +607,10 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if update.rows_affected() != 1 {
+            tx.rollback().await.map_err(internal)?;
+            return Ok(());
+        }
         let event = append_event_tx(
             &mut tx,
             submission_id,
@@ -530,44 +634,85 @@ impl Store {
     }
 
     pub async fn cancel(&self, submission_id: &str) -> Result<(String, u64), StoreError> {
-        let status = self.status(submission_id).await?;
-        if status.terminal {
-            return Ok(("already_terminal".to_owned(), status.revision));
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let row = sqlx::query(
+            "SELECT state, revision, cancel_requested FROM submissions WHERE submission_id = ?",
+        )
+        .bind(submission_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or(StoreError::NotFound)?;
+        let state = parse_submission_state(&row.try_get::<String, _>("state").map_err(internal)?)?;
+        let revision = to_u64(row.try_get("revision").map_err(internal)?)?;
+        let already_requested: bool = row.try_get("cancel_requested").map_err(internal)?;
+        if state.terminal() {
+            tx.commit().await.map_err(internal)?;
+            return Ok(("already_terminal".to_owned(), revision));
         }
-        if status.state == SubmissionState::Queued {
-            self.finish_queued(
+        let now = Utc::now();
+        if state == SubmissionState::Queued {
+            let update = sqlx::query(
+                r#"UPDATE submissions SET state = 'cancelled', revision = revision + 1,
+                   updated_at = ?, finished_at = ? WHERE submission_id = ? AND state = 'queued'"#,
+            )
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .bind(submission_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+            if update.rows_affected() != 1 {
+                return Err(StoreError::NotQueued);
+            }
+            let event = append_event_tx(
+                &mut tx,
                 submission_id,
-                SubmissionState::Cancelled,
-                "cancelled_by_client",
+                None,
+                "submission.state_changed",
+                json!({"from": "queued", "to": "cancelled", "reason": "cancelled_by_client"}),
             )
             .await?;
-            let updated = self.status(submission_id).await?;
-            return Ok(("cancelled".to_owned(), updated.revision));
+            tx.commit().await.map_err(internal)?;
+            let _ = self.events_tx.send(event);
+            return Ok(("cancelled".to_owned(), revision.saturating_add(1)));
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
-        sqlx::query(
-            "UPDATE submissions SET cancel_requested = 1, revision = revision + 1, updated_at = ? WHERE submission_id = ? AND state = 'running'",
+        if already_requested {
+            tx.commit().await.map_err(internal)?;
+            return Ok(("cancellation_requested".to_owned(), revision));
+        }
+        let attempt_id: Option<String> = sqlx::query_scalar(
+            "SELECT attempt_id FROM attempts WHERE submission_id = ? AND state IN ('starting', 'running') ORDER BY number DESC LIMIT 1",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(submission_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let update = sqlx::query(
+            "UPDATE submissions SET cancel_requested = 1, revision = revision + 1, updated_at = ? WHERE submission_id = ? AND state = 'running' AND cancel_requested = 0",
+        )
+        .bind(now.to_rfc3339())
         .bind(submission_id)
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if update.rows_affected() != 1 {
+            return Err(StoreError::NotQueued);
+        }
         let event = append_event_tx(
             &mut tx,
             submission_id,
-            status
-                .attempts
-                .last()
-                .map(|attempt| attempt.attempt_id.as_str()),
+            attempt_id.as_deref(),
             "cancellation.requested",
             json!({}),
         )
         .await?;
         tx.commit().await.map_err(internal)?;
         let _ = self.events_tx.send(event);
-        let updated = self.status(submission_id).await?;
-        Ok(("cancellation_requested".to_owned(), updated.revision))
+        Ok((
+            "cancellation_requested".to_owned(),
+            revision.saturating_add(1),
+        ))
     }
 
     pub async fn patch_scheduling(
@@ -580,46 +725,66 @@ impl Store {
         {
             return Err(StoreError::NotQueued);
         }
-        let current = self.status(submission_id).await?;
-        if current.revision != expected_revision {
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let row = sqlx::query(
+            "SELECT state, revision, priority, not_before, start_deadline FROM submissions WHERE submission_id = ?",
+        )
+        .bind(submission_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or(StoreError::NotFound)?;
+        let revision = to_u64(row.try_get("revision").map_err(internal)?)?;
+        if revision != expected_revision {
             return Err(StoreError::RevisionConflict);
         }
-        if current.state != SubmissionState::Queued {
+        if row.try_get::<String, _>("state").map_err(internal)? != "queued" {
             return Err(StoreError::NotQueued);
         }
-        let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Some(priority) = patch.priority {
-            sqlx::query("UPDATE submissions SET priority = ? WHERE submission_id = ?")
-                .bind(i64::from(priority))
-                .bind(submission_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
+        let priority = patch.priority.map_or_else(
+            || {
+                u8::try_from(row.try_get::<i64, _>("priority").map_err(internal)?)
+                    .map_err(|error| internal(anyhow::Error::from(error)))
+            },
+            Ok,
+        )?;
+        let current_not_before = parse_time(
+            row.try_get::<Option<String>, _>("not_before")
+                .map_err(internal)?
+                .as_deref(),
+        )?;
+        let current_deadline = parse_time(
+            row.try_get::<Option<String>, _>("start_deadline")
+                .map_err(internal)?
+                .as_deref(),
+        )?;
+        let not_before = patch.not_before.unwrap_or(current_not_before);
+        let start_deadline = patch.start_deadline.unwrap_or(current_deadline);
+        if let (Some(not_before), Some(start_deadline)) = (not_before, start_deadline)
+            && start_deadline <= not_before
+        {
+            return Err(StoreError::InvalidScheduling);
         }
-        if let Some(not_before) = patch.not_before {
-            sqlx::query("UPDATE submissions SET not_before = ? WHERE submission_id = ?")
-                .bind(not_before.map(|value| value.to_rfc3339()))
-                .bind(submission_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
-        }
-        if let Some(start_deadline) = patch.start_deadline {
-            sqlx::query("UPDATE submissions SET start_deadline = ? WHERE submission_id = ?")
-                .bind(start_deadline.map(|value| value.to_rfc3339()))
-                .bind(submission_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
-        }
-        sqlx::query(
-            "UPDATE submissions SET revision = revision + 1, updated_at = ? WHERE submission_id = ?",
+        let update = sqlx::query(
+            r#"UPDATE submissions SET priority = ?, not_before = ?, start_deadline = ?,
+               revision = revision + 1, updated_at = ?
+               WHERE submission_id = ? AND state = 'queued' AND revision = ?"#,
         )
+        .bind(i64::from(priority))
+        .bind(not_before.map(|value| value.to_rfc3339()))
+        .bind(start_deadline.map(|value| value.to_rfc3339()))
         .bind(Utc::now().to_rfc3339())
         .bind(submission_id)
+        .bind(
+            i64::try_from(expected_revision)
+                .map_err(|error| internal(anyhow::Error::from(error)))?,
+        )
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+        if update.rows_affected() != 1 {
+            return Err(StoreError::RevisionConflict);
+        }
         let event = append_event_tx(
             &mut tx,
             submission_id,
@@ -753,6 +918,65 @@ impl Store {
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    pub async fn reject_unfrozen_queued(&self) -> Result<u64, StoreError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"SELECT submission_id FROM submissions
+               WHERE state = 'queued' AND (
+                   resolved_profile_config_json IS NULL OR
+                   resolved_policy_config_json IS NULL OR
+                   resolved_routes_json IS NULL
+               )"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(internal)?;
+        let mut rejected = 0_u64;
+        for submission_id in rows {
+            let now = Utc::now();
+            let error = ErrorDetail {
+                code: "runtime_unavailable".to_owned(),
+                message: "submission predates durable execution snapshots; resubmit it".to_owned(),
+                retryable: false,
+                scope: thieving_eyes_protocol::ErrorScope::Submission,
+                retry_after_seconds: None,
+                field: None,
+            };
+            let mut tx = self.pool.begin().await.map_err(internal)?;
+            let update = sqlx::query(
+                r#"UPDATE submissions SET state = 'failed', revision = revision + 1,
+                   error_json = ?, updated_at = ?, finished_at = ?
+                   WHERE submission_id = ? AND state = 'queued'"#,
+            )
+            .bind(to_json(&error)?)
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .bind(&submission_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+            if update.rows_affected() == 0 {
+                tx.rollback().await.map_err(internal)?;
+                continue;
+            }
+            let event = append_event_tx(
+                &mut tx,
+                &submission_id,
+                None,
+                "submission.state_changed",
+                json!({
+                    "from": "queued",
+                    "to": "failed",
+                    "reason": "configuration_snapshot_missing"
+                }),
+            )
+            .await?;
+            tx.commit().await.map_err(internal)?;
+            let _ = self.events_tx.send(event);
+            rejected = rejected.saturating_add(1);
+        }
+        Ok(rejected)
     }
 
     async fn finish_queued(
@@ -943,6 +1167,18 @@ fn decode_queued(row: &sqlx::sqlite::SqliteRow) -> Result<QueuedSubmission, Stor
         )?,
         workspace_key: row.try_get("workspace_key").map_err(internal)?,
         workspace_access: row.try_get("workspace_access").map_err(internal)?,
+        profile: from_json(
+            &row.try_get::<String, _>("resolved_profile_config_json")
+                .map_err(internal)?,
+        )?,
+        policy: from_json(
+            &row.try_get::<String, _>("resolved_policy_config_json")
+                .map_err(internal)?,
+        )?,
+        routes: from_json(
+            &row.try_get::<String, _>("resolved_routes_json")
+                .map_err(internal)?,
+        )?,
     })
 }
 
@@ -1073,7 +1309,9 @@ fn internal(error: impl Into<anyhow::Error>) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thieving_eyes_protocol::{ContentPart, Input, TaskMode};
+    use crate::config::NetworkMode;
+    use chrono::TimeDelta;
+    use thieving_eyes_protocol::{ContentPart, Input, SubmissionPatch, TaskMode};
 
     async fn test_store() -> Store {
         Store::open("sqlite::memory:")
@@ -1087,6 +1325,35 @@ mod tests {
             version: "1".to_owned(),
             digest: format!("sha256:{}", "0".repeat(64)),
         }
+    }
+
+    fn profile_config() -> ProfileConfig {
+        ProfileConfig {
+            id: "p".to_owned(),
+            version: "1".to_owned(),
+            description: "test".to_owned(),
+            network: NetworkMode::None,
+        }
+    }
+
+    fn policy_config() -> PolicyConfig {
+        PolicyConfig {
+            id: "q".to_owned(),
+            version: "1".to_owned(),
+            description: "test".to_owned(),
+            run_timeout_seconds: 30,
+            idle_timeout_seconds: 10,
+        }
+    }
+
+    fn routes() -> Vec<RouteConfig> {
+        vec![RouteConfig {
+            id: "r".to_owned(),
+            adapter: "opencode".to_owned(),
+            model: String::new(),
+            source_ids: vec!["s".to_owned()],
+            target_id: "local".to_owned(),
+        }]
     }
 
     fn request() -> SubmissionCreate {
@@ -1110,51 +1377,270 @@ mod tests {
         }
     }
 
+    fn accept_spec(key: &str, digest: &str) -> AcceptSpec {
+        AcceptSpec {
+            client_id: "uid:1".to_owned(),
+            idempotency_key: key.to_owned(),
+            request: request(),
+            request_digest: digest.to_owned(),
+            profile: resource("p"),
+            policy: resource("q"),
+            workspace_key: None,
+            workspace_access: None,
+            profile_config: profile_config(),
+            policy_config: policy_config(),
+            routes: routes(),
+        }
+    }
+
+    fn claim_spec(submission_id: &str, attempt_id: &str) -> ClaimSpec {
+        ClaimSpec {
+            submission_id: submission_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            route_id: "r".to_owned(),
+            adapter: "opencode".to_owned(),
+            model: "test".to_owned(),
+            target_id: "local".to_owned(),
+            source_id: "s".to_owned(),
+            source_label: "source".to_owned(),
+            sandbox_profile: "p".to_owned(),
+            runtime: RuntimeRef {
+                name: "sandbox-agent".to_owned(),
+                version: "1".to_owned(),
+                digest: format!("sha256:{}", "1".repeat(64)),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn idempotency_is_scoped_and_strict() {
         let store = test_store().await;
         let first = store
-            .accept(AcceptSpec {
-                client_id: "uid:1".to_owned(),
-                idempotency_key: "key".to_owned(),
-                request: request(),
-                request_digest: "sha256:a".to_owned(),
-                profile: resource("p"),
-                policy: resource("q"),
-                workspace_key: None,
-                workspace_access: None,
-            })
+            .accept(accept_spec("key", "sha256:a"))
             .await
             .unwrap_or_else(|error| panic!("first accept: {error}"));
+        let mut changed_defaults = accept_spec("key", "sha256:a");
+        changed_defaults.profile = resource("new-profile");
+        changed_defaults.policy = resource("new-policy");
         let replay = store
-            .accept(AcceptSpec {
-                client_id: "uid:1".to_owned(),
-                idempotency_key: "key".to_owned(),
-                request: request(),
-                request_digest: "sha256:a".to_owned(),
-                profile: resource("p"),
-                policy: resource("q"),
-                workspace_key: None,
-                workspace_access: None,
-            })
+            .accept(changed_defaults)
             .await
             .unwrap_or_else(|error| panic!("replay accept: {error}"));
         assert_eq!(first.response.submission_id, replay.response.submission_id);
+        assert_eq!(
+            first.response.resolved_profile,
+            replay.response.resolved_profile
+        );
+        assert_eq!(
+            first.response.resolved_policy,
+            replay.response.resolved_policy
+        );
+        assert_eq!(replay.response.revision, 1);
         assert!(replay.replay);
+        let early_replay = store
+            .idempotent_replay("uid:1", "key", "sha256:a")
+            .await
+            .unwrap_or_else(|error| panic!("early replay: {error}"))
+            .unwrap_or_else(|| panic!("existing idempotency key should replay"));
+        assert_eq!(first.response.submission_id, early_replay.submission_id);
+        assert_eq!(
+            first.response.resolved_profile,
+            early_replay.resolved_profile
+        );
+        assert!(matches!(
+            store.accept(accept_spec("key", "sha256:b")).await,
+            Err(StoreError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            store.idempotent_replay("uid:1", "key", "sha256:b").await,
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_cannot_be_rewritten() {
+        let store = test_store().await;
+        let accepted = store
+            .accept(accept_spec("terminal", "sha256:terminal"))
+            .await
+            .unwrap_or_else(|error| panic!("accept: {error}"));
+        let id = accepted.response.submission_id;
+        store
+            .claim(&claim_spec(&id, "attempt-1"))
+            .await
+            .unwrap_or_else(|error| panic!("claim: {error}"));
+        store
+            .finish(FinishSpec {
+                submission_id: id.clone(),
+                attempt_id: "attempt-1".to_owned(),
+                state: SubmissionState::Completed,
+                output: Some("ok".to_owned()),
+                truncated: false,
+                error: None,
+                agent_version: Some("test".to_owned()),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("finish: {error}"));
         assert!(matches!(
             store
-                .accept(AcceptSpec {
-                    client_id: "uid:1".to_owned(),
-                    idempotency_key: "key".to_owned(),
-                    request: request(),
-                    request_digest: "sha256:b".to_owned(),
-                    profile: resource("p"),
-                    policy: resource("q"),
-                    workspace_key: None,
-                    workspace_access: None,
+                .finish(FinishSpec {
+                    submission_id: id.clone(),
+                    attempt_id: "attempt-1".to_owned(),
+                    state: SubmissionState::Uncertain,
+                    output: None,
+                    truncated: false,
+                    error: None,
+                    agent_version: None,
                 })
                 .await,
-            Err(StoreError::IdempotencyConflict)
+            Err(StoreError::NotQueued)
+        ));
+        assert_eq!(
+            store
+                .status(&id)
+                .await
+                .unwrap_or_else(|error| panic!("status: {error}"))
+                .state,
+            SubmissionState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_retains_source_and_writable_workspace_capacity() {
+        let store = test_store().await;
+        let mut first_spec = accept_spec("workspace-1", "sha256:workspace-1");
+        first_spec.workspace_key = Some("/workspace".to_owned());
+        first_spec.workspace_access = Some("writable".to_owned());
+        let first = store
+            .accept(first_spec)
+            .await
+            .unwrap_or_else(|error| panic!("accept first: {error}"));
+        store
+            .claim(&claim_spec(&first.response.submission_id, "attempt-1"))
+            .await
+            .unwrap_or_else(|error| panic!("claim first: {error}"));
+        store
+            .finish(FinishSpec {
+                submission_id: first.response.submission_id,
+                attempt_id: "attempt-1".to_owned(),
+                state: SubmissionState::Uncertain,
+                output: None,
+                truncated: false,
+                error: None,
+                agent_version: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("finish uncertain: {error}"));
+        assert_eq!(
+            store
+                .active_for_source("s")
+                .await
+                .unwrap_or_else(|error| panic!("capacity: {error}")),
+            1
+        );
+
+        let mut second_spec = accept_spec("workspace-2", "sha256:workspace-2");
+        second_spec.workspace_key = Some("/workspace".to_owned());
+        second_spec.workspace_access = Some("read_only".to_owned());
+        let second = store
+            .accept(second_spec)
+            .await
+            .unwrap_or_else(|error| panic!("accept second: {error}"));
+        assert!(matches!(
+            store
+                .claim(&claim_spec(&second.response.submission_id, "attempt-2"))
+                .await,
+            Err(StoreError::WorkspaceBusy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_idempotent_while_running() {
+        let store = test_store().await;
+        let accepted = store
+            .accept(accept_spec("cancel", "sha256:cancel"))
+            .await
+            .unwrap_or_else(|error| panic!("accept: {error}"));
+        let id = accepted.response.submission_id;
+        store
+            .claim(&claim_spec(&id, "attempt-1"))
+            .await
+            .unwrap_or_else(|error| panic!("claim: {error}"));
+        let first = store
+            .cancel(&id)
+            .await
+            .unwrap_or_else(|error| panic!("first cancel: {error}"));
+        let second = store
+            .cancel(&id)
+            .await
+            .unwrap_or_else(|error| panic!("second cancel: {error}"));
+        assert_eq!(first, second);
+        let events = store
+            .events_after(&id, 0)
+            .await
+            .unwrap_or_else(|error| panic!("events: {error}"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "cancellation.requested")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduling_patch_clears_nullable_time_and_checks_combination() {
+        let store = test_store().await;
+        let mut spec = accept_spec("patch", "sha256:patch");
+        let not_before = Utc::now() + TimeDelta::minutes(10);
+        let deadline = not_before + TimeDelta::minutes(10);
+        spec.request.scheduling = Some(thieving_eyes_protocol::Scheduling {
+            priority: Some(50),
+            not_before: Some(not_before),
+            start_deadline: Some(deadline),
+        });
+        let accepted = store
+            .accept(spec)
+            .await
+            .unwrap_or_else(|error| panic!("accept: {error}"));
+        let id = accepted.response.submission_id;
+        store
+            .patch_scheduling(
+                &id,
+                1,
+                &SubmissionPatch {
+                    priority: None,
+                    not_before: Some(None),
+                    start_deadline: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("clear not_before: {error}"));
+        let queued = store
+            .queued()
+            .await
+            .unwrap_or_else(|error| panic!("queued: {error}"));
+        assert_eq!(
+            queued
+                .first()
+                .unwrap_or_else(|| panic!("submission should remain queued"))
+                .not_before,
+            None
+        );
+
+        assert!(matches!(
+            store
+                .patch_scheduling(
+                    &id,
+                    2,
+                    &SubmissionPatch {
+                        priority: None,
+                        not_before: Some(Some(deadline + TimeDelta::minutes(1))),
+                        start_deadline: None,
+                    },
+                )
+                .await,
+            Err(StoreError::InvalidScheduling)
         ));
     }
 }

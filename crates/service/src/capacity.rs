@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout};
@@ -151,7 +151,20 @@ impl CapacityManager {
                 }
                 Err(error) => {
                     tracing::warn!(source_id = %source.id, %error, "capacity probe failed closed");
-                    self.observations.write().await.remove(&source.id);
+                    let now = Utc::now();
+                    self.observations.write().await.insert(
+                        source.id.clone(),
+                        Observation {
+                            response: CapacityProbeResponse {
+                                protocol_version: 1,
+                                observed_at: now,
+                                health: ProbeHealth::Unavailable,
+                                usage: None,
+                            },
+                            received_at: now,
+                            next_poll: Instant::now() + Duration::from_secs(*interval_seconds),
+                        },
+                    );
                     let _ = self
                         .store
                         .record_capacity(&source.id, "unknown", None, None, None)
@@ -224,20 +237,30 @@ async fn run_probe(source: &SourceConfig) -> Result<CapacityProbeResponse> {
             .await
             .context("write capacity probe request")?;
     }
-    let output = timeout(
-        Duration::from_secs((*timeout_seconds).max(1)),
-        child.wait_with_output(),
-    )
+    let stdout = child
+        .stdout
+        .take()
+        .context("capacity probe stdout missing")?;
+    let (status, output) = timeout(Duration::from_secs((*timeout_seconds).max(1)), async {
+        tokio::try_join!(child.wait(), async {
+            let mut output = Vec::new();
+            stdout
+                .take(u64::try_from(MAX_PROBE_OUTPUT_BYTES + 1).unwrap_or(u64::MAX))
+                .read_to_end(&mut output)
+                .await?;
+            Ok::<_, std::io::Error>(output)
+        })
+    })
     .await
     .context("capacity probe timeout")??;
-    if !output.status.success() {
-        bail!("capacity probe exited with {}", output.status);
+    if !status.success() {
+        bail!("capacity probe exited with {status}");
     }
-    if output.stdout.len() > MAX_PROBE_OUTPUT_BYTES {
+    if output.len() > MAX_PROBE_OUTPUT_BYTES {
         bail!("capacity probe output exceeds limit");
     }
     let response: CapacityProbeResponse =
-        serde_json::from_slice(&output.stdout).context("decode capacity probe response")?;
+        serde_json::from_slice(&output).context("decode capacity probe response")?;
     if response.protocol_version != 1 {
         bail!("unsupported capacity probe protocol version");
     }

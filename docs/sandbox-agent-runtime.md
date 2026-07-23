@@ -123,7 +123,7 @@ runner 在 prompt 前建立 SSE，并以 Sandbox Agent SSE ID 在同一 runtime 
 
 daemon 的 Submission `sequence` 与 Sandbox Agent SSE ID 是两个命名空间。去重键至少包含 `(runtime_instance_id, generation, runtime_event_id)`；归一化事件不能把上游 ID 直接当公共 sequence。
 
-prompt 的 ACP response 与其因果上先发生的 session update 都被接收后，runner 才判定该 turn 已结束。`stopReason=end_turn` 或等价正常结束可进入结果导出；取消、预算、拒绝、adapter exit 和未知 stop reason 必须显式映射，不能都当作成功。最终 text 来自当前 turn 的 agent message 聚合，不能从进程 stdout 随意截取。
+`session/prompt` POST 的成功响应可能是带 JSON-RPC envelope 的 `200`，也可能只确认接收而由 SSE 返回 response envelope；Rust binding 必须合并这两条通道并按 request ID 去重，以 SSE 中有序的 response envelope 作为 turn 完成边界。prompt response 与其因果上先发生的 session update 都被接收后，runner 才判定该 turn 已结束。`stopReason=end_turn` 或等价正常结束可进入结果导出；取消、预算、拒绝、adapter exit 和未知 stop reason 必须显式映射，不能都当作成功。最终 text 来自当前 turn 的 agent message 聚合，不能从进程 stdout 随意截取。
 
 Sandbox Agent SSE buffer 和 SDK persist driver 都不是持久事实来源。runner/daemon 必须边收边保存；同一 runtime 重连使用 Last-Event-ID，runtime generation 改变后不得假设旧 offset 仍有效。
 

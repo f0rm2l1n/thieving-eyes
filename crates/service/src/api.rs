@@ -8,7 +8,6 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -18,11 +17,10 @@ use thieving_eyes_protocol::{
     SubmissionAccepted, SubmissionCreate, SubmissionPatch, SubmissionStatus, TaskMode,
     WorkspaceAccess, WorkspaceRef,
 };
-use tokio_stream::wrappers::BroadcastStream;
 use ulid::Ulid;
 
 use crate::ServiceState;
-use crate::config::Config;
+use crate::config::{Config, PolicyConfig, ProfileConfig, RouteConfig};
 use crate::store::{AcceptSpec, StoreError};
 
 pub fn router(state: ServiceState) -> Router {
@@ -74,12 +72,21 @@ async fn create_submission(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty() && value.len() <= 200)
         .ok_or_else(|| ApiFailure::invalid("Idempotency-Key header is required", None))?;
-    let resolved = validate_request(&state.config, &request).await?;
     let digest = request_digest(&request)?;
+    let client_id = local_client_id();
+    if let Some(replay) = state
+        .store
+        .idempotent_replay(&client_id, key, &digest)
+        .await
+        .map_err(ApiFailure::from_store)?
+    {
+        return Ok((StatusCode::OK, Json(replay)));
+    }
+    let resolved = validate_request(&state.config, &request).await?;
     let accepted = state
         .store
         .accept(AcceptSpec {
-            client_id: local_client_id(),
+            client_id,
             idempotency_key: key.to_owned(),
             request,
             request_digest: digest,
@@ -87,6 +94,9 @@ async fn create_submission(
             policy: resolved.policy,
             workspace_key: resolved.workspace_key,
             workspace_access: resolved.workspace_access,
+            profile_config: resolved.profile_config,
+            policy_config: resolved.policy_config,
+            routes: resolved.routes,
         })
         .await
         .map_err(ApiFailure::from_store)?;
@@ -203,25 +213,66 @@ async fn events(
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or(0);
+    let mut receiver = state.store.subscribe();
     let initial = state
         .store
         .events_after(&submission_id, after)
         .await
         .map_err(ApiFailure::from_store)?;
-    let initial_stream = stream::iter(initial.into_iter().map(event_to_sse));
-    let wanted_id = submission_id;
-    let live = BroadcastStream::new(state.store.subscribe()).filter_map(move |item| {
-        let wanted_id = wanted_id.clone();
-        async move {
-            match item {
-                Ok(event) if event.submission_id == wanted_id && event.sequence > after => {
-                    Some(event_to_sse(event))
-                }
-                _ => None,
+    let store = state.store.clone();
+    let event_stream = async_stream::stream! {
+        let mut last_sequence = after;
+        for event in initial {
+            if event.sequence > last_sequence {
+                last_sequence = event.sequence;
+                yield event_to_sse(event);
             }
         }
-    });
-    Ok(Sse::new(initial_stream.chain(live)).keep_alive(KeepAlive::default()))
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.submission_id == submission_id && event.sequence > last_sequence => {
+                    if event.sequence == last_sequence.saturating_add(1) {
+                        last_sequence = event.sequence;
+                        yield event_to_sse(event);
+                    } else {
+                        match store.events_after(&submission_id, last_sequence).await {
+                            Ok(events) => {
+                                for event in events {
+                                    if event.sequence > last_sequence {
+                                        last_sequence = event.sequence;
+                                        yield event_to_sse(event);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, %submission_id, "failed to recover SSE sequence gap");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    match store.events_after(&submission_id, last_sequence).await {
+                        Ok(events) => {
+                            for event in events {
+                                if event.sequence > last_sequence {
+                                    last_sequence = event.sequence;
+                                    yield event_to_sse(event);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %submission_id, "failed to recover lagged SSE stream");
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
 async fn result(
@@ -357,6 +408,9 @@ struct ResolvedRequest {
     policy: ResourceRef,
     workspace_key: Option<String>,
     workspace_access: Option<String>,
+    profile_config: ProfileConfig,
+    policy_config: PolicyConfig,
+    routes: Vec<RouteConfig>,
 }
 
 async fn validate_request(
@@ -446,14 +500,14 @@ async fn validate_request(
         ));
     }
 
-    let profile_id = request
+    let profile_selector = request
         .agent
         .as_ref()
         .and_then(|agent| agent.profile.as_ref())
-        .map_or(config.defaults.profile_id.as_str(), |profile| {
-            profile.id.as_str()
-        });
-    let profile = config.profile(profile_id).ok_or_else(|| {
+        .map(|profile| (profile.id.as_str(), profile.version.as_deref()));
+    let (profile_id, profile_version) =
+        profile_selector.unwrap_or((config.defaults.profile_id.as_str(), None));
+    let profile = config.profile(profile_id, profile_version).ok_or_else(|| {
         ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "policy_denied",
@@ -461,13 +515,13 @@ async fn validate_request(
             ErrorScope::Request,
         )
     })?;
-    let policy_id = request
+    let policy_selector = request
         .policy
         .as_ref()
-        .map_or(config.defaults.policy_id.as_str(), |policy| {
-            policy.id.as_str()
-        });
-    let policy = config.policy(policy_id).ok_or_else(|| {
+        .map(|policy| (policy.id.as_str(), policy.version.as_deref()));
+    let (policy_id, policy_version) =
+        policy_selector.unwrap_or((config.defaults.policy_id.as_str(), None));
+    let policy = config.policy(policy_id, policy_version).ok_or_else(|| {
         ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "policy_denied",
@@ -491,18 +545,33 @@ async fn validate_request(
                 ErrorScope::Route,
             ));
         }
-        if execution
-            .route_ids
-            .as_ref()
-            .is_some_and(|routes| !routes.iter().any(|route| config.route(route).is_some()))
-        {
-            return Err(ApiFailure::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "route_unsatisfied",
-                "no requested route is configured",
-                ErrorScope::Route,
-            ));
-        }
+    }
+
+    let requested_model = request
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.model.as_deref());
+    let route_ids = request
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.route_ids.as_ref())
+        .cloned()
+        .unwrap_or_else(|| vec![config.defaults.route_id.clone()]);
+    let routes: Vec<RouteConfig> = route_ids
+        .iter()
+        .filter_map(|id| config.route(id))
+        .filter(|route| {
+            requested_model.is_none_or(|model| route.model.is_empty() || route.model == model)
+        })
+        .cloned()
+        .collect();
+    if routes.is_empty() {
+        return Err(ApiFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsatisfied",
+            "no requested route can satisfy the Agent model",
+            ErrorScope::Route,
+        ));
     }
 
     let (workspace_key, workspace_access) = validate_workspace(config, request).await?;
@@ -523,6 +592,9 @@ async fn validate_request(
         policy: resource_ref(&policy.id, &policy.version, policy),
         workspace_key,
         workspace_access,
+        profile_config: profile.clone(),
+        policy_config: policy.clone(),
+        routes,
     })
 }
 
@@ -758,6 +830,10 @@ impl ApiFailure {
                 "workspace_unavailable",
                 "workspace has an active writable attempt",
                 ErrorScope::Submission,
+            ),
+            StoreError::InvalidScheduling => Self::invalid(
+                "start_deadline must be after not_before",
+                Some("/start_deadline"),
             ),
             StoreError::Internal(error) => {
                 tracing::error!(%error, "store request failed");

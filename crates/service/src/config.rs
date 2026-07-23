@@ -79,8 +79,16 @@ pub struct ProfileConfig {
     pub version: String,
     #[serde(default = "default_profile_description")]
     pub description: String,
-    #[serde(default = "default_network")]
-    pub network: String,
+    #[serde(default)]
+    pub network: NetworkMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    #[default]
+    Inherited,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +190,18 @@ impl Config {
             bail!("default route does not exist");
         }
 
+        ensure_unique_resource_versions(
+            self.profiles
+                .iter()
+                .map(|item| (item.id.as_str(), item.version.as_str())),
+            "profile",
+        )?;
+        ensure_unique_resource_versions(
+            self.policies
+                .iter()
+                .map(|item| (item.id.as_str(), item.version.as_str())),
+            "policy",
+        )?;
         ensure_unique(self.sources.iter().map(|item| item.id.as_str()), "source")?;
         ensure_unique(self.routes.iter().map(|item| item.id.as_str()), "route")?;
         ensure_unique(
@@ -190,6 +210,27 @@ impl Config {
         )?;
 
         let source_ids: HashSet<_> = self.sources.iter().map(|item| item.id.as_str()).collect();
+        for source in &self.sources {
+            if source.concurrency_limit == 0 {
+                bail!("source {} has a zero concurrency limit", source.id);
+            }
+            if source.safety_reserve > source.concurrency_limit {
+                bail!("source {} safety reserve exceeds its limit", source.id);
+            }
+            if let CapacityMonitorConfig::Command {
+                interval_seconds,
+                timeout_seconds,
+                max_age_seconds,
+                ..
+            } = source.monitor
+                && (interval_seconds == 0 || timeout_seconds == 0 || max_age_seconds == 0)
+            {
+                bail!(
+                    "source {} capacity monitor durations must be positive",
+                    source.id
+                );
+            }
+        }
         for route in &self.routes {
             if route.adapter != "opencode" {
                 bail!("v0.1 only supports the opencode adapter");
@@ -205,6 +246,20 @@ impl Config {
                     route.id
                 );
             }
+            if route.target_id != "local" {
+                bail!("v0.1 route {} must target local", route.id);
+            }
+        }
+
+        if self.daemon.max_inline_output_bytes == 0 {
+            bail!("max_inline_output_bytes must be positive");
+        }
+        if self
+            .policies
+            .iter()
+            .any(|policy| policy.run_timeout_seconds == 0 || policy.idle_timeout_seconds == 0)
+        {
+            bail!("policy timeout durations must be positive");
         }
 
         for mapping in &self.local_runner.credential_files {
@@ -220,13 +275,21 @@ impl Config {
     }
 
     #[must_use]
-    pub fn profile(&self, id: &str) -> Option<&ProfileConfig> {
-        self.profiles.iter().find(|profile| profile.id == id)
+    pub fn profile(&self, id: &str, version: Option<&str>) -> Option<&ProfileConfig> {
+        self.profiles
+            .iter()
+            .filter(|profile| profile.id == id)
+            .filter(|profile| version.is_none_or(|version| profile.version == version))
+            .max_by(|left, right| left.version.cmp(&right.version))
     }
 
     #[must_use]
-    pub fn policy(&self, id: &str) -> Option<&PolicyConfig> {
-        self.policies.iter().find(|policy| policy.id == id)
+    pub fn policy(&self, id: &str, version: Option<&str>) -> Option<&PolicyConfig> {
+        self.policies
+            .iter()
+            .filter(|policy| policy.id == id)
+            .filter(|policy| version.is_none_or(|version| policy.version == version))
+            .max_by(|left, right| left.version.cmp(&right.version))
     }
 
     #[must_use]
@@ -297,6 +360,19 @@ fn ensure_unique<'a>(items: impl Iterator<Item = &'a str>, label: &str) -> Resul
     Ok(())
 }
 
+fn ensure_unique_resource_versions<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str)>,
+    label: &str,
+) -> Result<()> {
+    let mut values = HashSet::new();
+    for (id, version) in items {
+        if id.is_empty() || version.is_empty() || !values.insert((id, version)) {
+            bail!("{label} ID/version pairs must be non-empty and unique");
+        }
+    }
+    Ok(())
+}
+
 fn validate_relative_sandbox_path(path: &Path) -> Result<()> {
     if path.is_absolute()
         || path.components().any(|component| {
@@ -325,10 +401,6 @@ fn default_profile_description() -> String {
 
 fn default_policy_description() -> String {
     "Single-attempt local execution policy".to_owned()
-}
-
-fn default_network() -> String {
-    "inherited".to_owned()
 }
 
 const fn default_run_timeout() -> u64 {

@@ -37,3 +37,4 @@ eyes run --workspace /absolute/project "完成后台任务"
 - [Sandbox Agent runtime binding](docs/sandbox-agent-runtime.md)
 - [Goal mode](docs/goal-mode.md)
 - [配置模型](docs/configuration.md)
+- [内网构建与部署](docs/intranet-deployment.md)

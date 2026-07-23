@@ -478,13 +478,30 @@ pub struct CancellationResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SubmissionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub not_before: Option<Option<DateTime<Utc>>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub start_deadline: Option<Option<DateTime<Utc>>>,
+}
+
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -565,5 +582,15 @@ mod tests {
     fn terminal_is_explicit() {
         assert!(!SubmissionState::Queued.terminal());
         assert!(SubmissionState::Uncertain.terminal());
+    }
+
+    #[test]
+    fn patch_distinguishes_missing_from_null() {
+        let patch: SubmissionPatch = serde_json::from_value(serde_json::json!({
+            "not_before": null
+        }))
+        .unwrap_or_else(|error| panic!("patch should decode: {error}"));
+        assert_eq!(patch.not_before, Some(None));
+        assert_eq!(patch.start_deadline, None);
     }
 }

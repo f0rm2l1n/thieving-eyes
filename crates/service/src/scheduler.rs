@@ -1,15 +1,12 @@
 use std::collections::HashMap;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
-use thieving_eyes_protocol::{
-    ContentPart, ErrorDetail, ErrorScope, RuntimeRef, SubmissionCreate, SubmissionState,
-    WorkspaceAccess, WorkspaceRef,
-};
+use thieving_eyes_protocol::{ContentPart, ErrorDetail, ErrorScope, RuntimeRef, SubmissionState};
 use thieving_eyes_runner::{CredentialMount, RunnerRequest};
 use thieving_eyes_runtime_sandbox_agent::RuntimeEvent;
 use tokio::sync::{Notify, RwLock, mpsc, watch};
@@ -18,7 +15,7 @@ use tokio::time::MissedTickBehavior;
 use ulid::Ulid;
 
 use crate::capacity::CapacityManager;
-use crate::config::{Config, SANDBOX_AGENT_SHA256, SANDBOX_AGENT_VERSION};
+use crate::config::{Config, NetworkMode, SANDBOX_AGENT_SHA256, SANDBOX_AGENT_VERSION};
 use crate::store::{ClaimSpec, FinishSpec, QueuedSubmission, Store, StoreError};
 
 pub type CancellationRegistry = Arc<RwLock<HashMap<String, watch::Sender<bool>>>>;
@@ -34,6 +31,13 @@ pub struct SchedulerContext {
 
 pub async fn run(context: SchedulerContext, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     context.capacity.initialize().await?;
+    let rejected = context.store.reject_unfrozen_queued().await?;
+    if rejected > 0 {
+        tracing::warn!(
+            rejected,
+            "rejected queued submissions without frozen execution snapshots"
+        );
+    }
     let recovered = context.store.recover_running_as_uncertain().await?;
     if recovered > 0 {
         tracing::warn!(recovered, "recovered unfinished attempts as uncertain");
@@ -95,10 +99,10 @@ pub async fn run(context: SchedulerContext, mut shutdown: watch::Receiver<bool>)
                             .model
                             .clone()
                             .unwrap_or_else(|| "agent_default".to_owned()),
-                        target_id: "local".to_owned(),
+                        target_id: dispatch.target_id.clone(),
                         source_id: dispatch.source_id.clone(),
                         source_label: dispatch.source_label.clone(),
-                        sandbox_profile: context.config.defaults.profile_id.clone(),
+                        sandbox_profile: submission.profile.id.clone(),
                         runtime: RuntimeRef {
                             name: "sandbox-agent".to_owned(),
                             version: SANDBOX_AGENT_VERSION.to_owned(),
@@ -113,19 +117,74 @@ pub async fn run(context: SchedulerContext, mut shutdown: watch::Receiver<bool>)
                                 .write()
                                 .await
                                 .insert(submission.submission_id.clone(), cancel_tx);
+                            match context
+                                .store
+                                .cancellation_requested(&submission.submission_id)
+                                .await
+                            {
+                                Ok(true) => {
+                                    if let Some(sender) = context
+                                        .cancellations
+                                        .read()
+                                        .await
+                                        .get(&submission.submission_id)
+                                    {
+                                        let _ = sender.send(true);
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::error!(%error, "failed to close cancellation registration race");
+                                    if let Some(sender) = context
+                                        .cancellations
+                                        .read()
+                                        .await
+                                        .get(&submission.submission_id)
+                                    {
+                                        let _ = sender.send(true);
+                                    }
+                                }
+                            }
                             let task_context = context.clone();
                             attempts.spawn(async move {
-                                if let Err(error) = run_attempt(
+                                let result = run_attempt(
                                     task_context.clone(),
-                                    submission,
-                                    attempt_id,
+                                    submission.clone(),
+                                    attempt_id.clone(),
                                     dispatch,
                                     cancel_rx,
                                 )
-                                .await
-                                {
+                                .await;
+                                if let Err(error) = result {
                                     tracing::error!(%error, "attempt execution failed internally");
+                                    let detail = ErrorDetail {
+                                        code: "runner_lost".to_owned(),
+                                        message: "attempt control failed before a terminal report"
+                                            .to_owned(),
+                                        retryable: false,
+                                        scope: ErrorScope::Attempt,
+                                        retry_after_seconds: None,
+                                        field: None,
+                                    };
+                                    let _ = task_context
+                                        .store
+                                        .finish(FinishSpec {
+                                            submission_id: submission.submission_id.clone(),
+                                            attempt_id,
+                                            state: SubmissionState::Uncertain,
+                                            output: None,
+                                            truncated: false,
+                                            error: Some(detail),
+                                            agent_version: None,
+                                        })
+                                        .await;
                                 }
+                                task_context
+                                    .cancellations
+                                    .write()
+                                    .await
+                                    .remove(&submission.submission_id);
+                                task_context.notify.notify_one();
                             });
                         }
                         Err(StoreError::WorkspaceBusy) => {
@@ -165,46 +224,52 @@ struct Dispatch {
     source_id: String,
     source_label: String,
     model: Option<String>,
+    target_id: String,
 }
 
 async fn select_dispatch(
     context: &SchedulerContext,
     submission: &QueuedSubmission,
 ) -> Result<DispatchDecision> {
-    let requested_routes = submission
-        .request
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.route_ids.as_ref());
-    let route = requested_routes
-        .and_then(|ids| ids.iter().find_map(|id| context.config.route(id)))
-        .or_else(|| context.config.route(&context.config.defaults.route_id))
-        .context("resolved route disappeared from configuration")?;
     let requested_model = submission
         .request
         .agent
         .as_ref()
         .and_then(|agent| agent.model.clone());
-    let model = requested_model.or_else(|| (!route.model.is_empty()).then(|| route.model.clone()));
     let mut saw_unknown = false;
-    for source_id in &route.source_ids {
-        let source = context
-            .config
-            .source(source_id)
-            .with_context(|| format!("route references missing source {source_id}"))?;
-        let active = context.store.active_for_source(source_id).await?;
-        match context.capacity.available(source, active).await {
-            Some(available) if available > 0 => {
-                return Ok(DispatchDecision::Ready(Dispatch {
-                    route_id: route.id.clone(),
-                    source_id: source.id.clone(),
-                    source_label: source.label.clone(),
-                    model,
-                }));
+    let mut saw_route = false;
+    for route in submission
+        .routes
+        .iter()
+        .filter(|route| route.target_id == "local")
+    {
+        saw_route = true;
+        let model = requested_model
+            .clone()
+            .or_else(|| (!route.model.is_empty()).then(|| route.model.clone()));
+        for source_id in &route.source_ids {
+            let Some(source) = context.config.source(source_id) else {
+                saw_unknown = true;
+                continue;
+            };
+            let active = context.store.active_for_source(source_id).await?;
+            match context.capacity.available(source, active).await {
+                Some(available) if available > 0 => {
+                    return Ok(DispatchDecision::Ready(Dispatch {
+                        route_id: route.id.clone(),
+                        source_id: source.id.clone(),
+                        source_label: source.label.clone(),
+                        model,
+                        target_id: route.target_id.clone(),
+                    }));
+                }
+                None => saw_unknown = true,
+                Some(_) => {}
             }
-            None => saw_unknown = true,
-            Some(_) => {}
         }
+    }
+    if !saw_route {
+        return Ok(DispatchDecision::Blocked("route_unsatisfied"));
     }
     Ok(DispatchDecision::Blocked(if saw_unknown {
         "capacity_unknown"
@@ -231,19 +296,9 @@ async fn run_attempt(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let (workspace_path, writable) =
-        resolve_workspace(&context.config, &submission.request).await?;
-    let policy_id = submission
-        .request
-        .policy
-        .as_ref()
-        .map_or(context.config.defaults.policy_id.as_str(), |policy| {
-            policy.id.as_str()
-        });
-    let policy = context
-        .config
-        .policy(policy_id)
-        .context("resolved policy is unavailable")?;
+    let workspace_path = submission.workspace_key.as_ref().map(PathBuf::from);
+    let writable = submission.workspace_access.as_deref() == Some("writable");
+    let policy = &submission.policy;
     let run_timeout = submission
         .request
         .limits
@@ -278,39 +333,52 @@ async fn run_attempt(
         bubblewrap_path: context.config.local_runner.bubblewrap_binary.clone(),
         workspace_path,
         workspace_writable: writable,
+        network_enabled: submission.profile.network == NetworkMode::Inherited,
         credential_mounts,
         prompt,
         model: dispatch.model,
         run_timeout_seconds: run_timeout,
         idle_timeout_seconds: idle_timeout,
+        max_output_bytes: context
+            .config
+            .daemon
+            .max_inline_output_bytes
+            .saturating_add(4),
     };
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let runner_binary = context.config.local_runner.runner_binary.clone();
-    let mut runner_task = tokio::spawn(async move {
-        thieving_eyes_runner::execute(&runner_binary, runner_request, cancel, event_tx).await
-    });
+    let runner_task =
+        thieving_eyes_runner::execute(&runner_binary, runner_request, cancel, event_tx);
+    tokio::pin!(runner_task);
+    let mut runner_finished = false;
     let mut terminal_seen = false;
-    while let Some(event) = tokio::select! {
-        event = event_rx.recv() => event,
-        result = &mut runner_task => {
-            match result {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "runner failed before terminal report");
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "runner task join failed");
-                    None
+    loop {
+        let event = if runner_finished {
+            event_rx.recv().await
+        } else {
+            tokio::select! {
+                event = event_rx.recv() => event,
+                result = &mut runner_task => {
+                    runner_finished = true;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "runner failed before terminal report");
+                    }
+                    continue;
                 }
             }
-        }
-    } {
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
             RuntimeEvent::Started { agent_version } => {
                 context
                     .store
-                    .mark_attempt_running(&submission.submission_id, &attempt_id)
+                    .mark_attempt_running(
+                        &submission.submission_id,
+                        &attempt_id,
+                        agent_version.as_deref(),
+                    )
                     .await?;
                 context
                     .store
@@ -344,16 +412,26 @@ async fn run_attempt(
                     )
                     .await?;
             }
-            RuntimeEvent::Plan { data } => {
+            RuntimeEvent::Plan { entries } => {
                 context
                     .store
-                    .append_agent_event(&submission.submission_id, &attempt_id, "agent.plan", data)
+                    .append_agent_event(
+                        &submission.submission_id,
+                        &attempt_id,
+                        "agent.plan",
+                        json!({"entries": entries}),
+                    )
                     .await?;
             }
-            RuntimeEvent::Usage { data } => {
+            RuntimeEvent::Usage { used, size, cost } => {
                 context
                     .store
-                    .append_agent_event(&submission.submission_id, &attempt_id, "agent.usage", data)
+                    .append_agent_event(
+                        &submission.submission_id,
+                        &attempt_id,
+                        "agent.usage",
+                        json!({"used": used, "size": size, "cost": cost}),
+                    )
                     .await?;
             }
             RuntimeEvent::Completed { output } => {
@@ -414,6 +492,30 @@ async fn run_attempt(
                 terminal_seen = true;
                 break;
             }
+            RuntimeEvent::Uncertain { code, message } => {
+                let error = ErrorDetail {
+                    retryable: false,
+                    scope: ErrorScope::Attempt,
+                    retry_after_seconds: None,
+                    field: None,
+                    code,
+                    message,
+                };
+                context
+                    .store
+                    .finish(FinishSpec {
+                        submission_id: submission.submission_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        state: SubmissionState::Uncertain,
+                        output: None,
+                        truncated: false,
+                        error: Some(error),
+                        agent_version: None,
+                    })
+                    .await?;
+                terminal_seen = true;
+                break;
+            }
         }
     }
     if !terminal_seen {
@@ -430,7 +532,7 @@ async fn run_attempt(
             .finish(FinishSpec {
                 submission_id: submission.submission_id.clone(),
                 attempt_id: attempt_id.clone(),
-                state: SubmissionState::Failed,
+                state: SubmissionState::Uncertain,
                 output: None,
                 truncated: false,
                 error: Some(error),
@@ -438,54 +540,7 @@ async fn run_attempt(
             })
             .await?;
     }
-    runner_task.abort();
-    let _ = runner_task.await;
-    context
-        .cancellations
-        .write()
-        .await
-        .remove(&submission.submission_id);
-    context.notify.notify_one();
     Ok(())
-}
-
-async fn resolve_workspace(
-    config: &Config,
-    request: &SubmissionCreate,
-) -> Result<(Option<PathBuf>, bool)> {
-    let Some(workspace) = request.workspace.as_ref() else {
-        return Ok((None, false));
-    };
-    let WorkspaceRef::Local {
-        root_id,
-        path,
-        access,
-        ..
-    } = workspace
-    else {
-        bail!("remote workspace bindings are unavailable in v0.1");
-    };
-    let root = config
-        .workspace_root(root_id)
-        .context("workspace root is unavailable")?;
-    let relative = path.as_deref().unwrap_or("");
-    if PathBuf::from(relative).is_absolute()
-        || PathBuf::from(relative)
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        bail!("workspace path escapes configured root");
-    }
-    let canonical_root = tokio::fs::canonicalize(&root.path).await?;
-    let canonical = tokio::fs::canonicalize(canonical_root.join(relative)).await?;
-    if !canonical.starts_with(&canonical_root) {
-        bail!("workspace path escapes configured root through a symlink");
-    }
-    let writable = *access == WorkspaceAccess::Writable;
-    if writable && !root.allow_writable {
-        bail!("workspace root does not allow writable execution");
-    }
-    Ok((Some(canonical), writable))
 }
 
 fn effective_priority(item: &QueuedSubmission) -> u16 {
