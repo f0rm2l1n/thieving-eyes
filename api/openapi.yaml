@@ -1,0 +1,447 @@
+openapi: 3.1.0
+info:
+  title: thieving-eyes Submission API
+  version: 1.0.0
+  description: Durable, capacity-aware background execution for headless coding agents.
+  license: { name: Apache-2.0, identifier: Apache-2.0 }
+security:
+  - bearerAuth: []
+servers:
+  - url: https://{host}/v1
+    description: Deployment-specific HTTPS endpoint; local clients use the same HTTP API over UDS.
+    variables:
+      host:
+        default: thieving-eyes.internal
+paths:
+  /submissions:
+    post:
+      summary: Create a durable submission
+      operationId: createSubmission
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmissionCreate' }
+      responses:
+        '201': { $ref: '#/components/responses/SubmissionAccepted' }
+        '200': { $ref: '#/components/responses/SubmissionAccepted' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      summary: List submissions
+      operationId: listSubmissions
+      responses:
+        '200':
+          description: Submission page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Page'
+                  - type: object
+                    properties:
+                      items: { type: array, items: { $ref: '#/components/schemas/SubmissionStatus' } }
+        '4XX': { $ref: '#/components/responses/Error' }
+  /submissions/{submission_id}:
+    parameters: [{ $ref: '#/components/parameters/SubmissionId' }]
+    get:
+      summary: Get submission status
+      operationId: getSubmission
+      responses:
+        '200':
+          description: Current status
+          content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionStatus' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      summary: Update queued scheduling constraints
+      operationId: patchSubmission
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionPatch' } } }
+      responses:
+        '200':
+          description: Updated status
+          content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionStatus' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /submissions/{submission_id}/cancel:
+    parameters: [{ $ref: '#/components/parameters/SubmissionId' }]
+    post:
+      summary: Request submission cancellation
+      operationId: cancelSubmission
+      responses:
+        '200':
+          description: Cancellation disposition
+          content: { application/json: { schema: { $ref: '#/components/schemas/CancellationResult' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /submissions/{submission_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/SubmissionId'
+      - name: after_sequence
+        in: query
+        schema: { type: integer, minimum: 0 }
+    get:
+      summary: Watch persistent submission events
+      operationId: watchSubmissionEvents
+      responses:
+        '200':
+          description: Persistent event stream
+          content: { text/event-stream: { schema: { $ref: '#/components/schemas/EventEnvelope' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /submissions/{submission_id}/result:
+    parameters: [{ $ref: '#/components/parameters/SubmissionId' }]
+    get:
+      summary: Get a terminal submission result
+      operationId: getSubmissionResult
+      responses:
+        '200':
+          description: Terminal result
+          content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionResult' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
+  /sessions:
+    get: { summary: List sessions, operationId: listSessions, responses: { '200': { $ref: '#/components/responses/EmptyPage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /sessions/{session_id}:
+    parameters: [{ name: session_id, in: path, required: true, schema: { type: string } }]
+    get: { summary: Get a session, operationId: getSession, responses: { '4XX': { $ref: '#/components/responses/Error' }, default: { $ref: '#/components/responses/Error' } } }
+  /sessions/{session_id}/submissions:
+    parameters: [{ name: session_id, in: path, required: true, schema: { type: string } }]
+    get: { summary: List session submissions, operationId: listSessionSubmissions, responses: { '200': { $ref: '#/components/responses/EmptyPage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /sessions/{session_id}/events:
+    parameters: [{ name: session_id, in: path, required: true, schema: { type: string } }]
+    get: { summary: List session events, operationId: listSessionEvents, responses: { '200': { $ref: '#/components/responses/EmptyPage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /capabilities:
+    get:
+      summary: Get effective capabilities
+      operationId: getCapabilities
+      responses:
+        '200':
+          description: Effective capability catalog
+          content: { application/json: { schema: { $ref: '#/components/schemas/CapabilityCatalog' } } }
+        '4XX': { $ref: '#/components/responses/Error' }
+  /profiles:
+    get: { summary: List profiles, operationId: listProfiles, responses: { '200': { $ref: '#/components/responses/ResourcePage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /profiles/{profile_id}/versions/{version}:
+    parameters:
+      - { name: profile_id, in: path, required: true, schema: { type: string } }
+      - { name: version, in: path, required: true, schema: { type: string } }
+    get: { summary: Get a profile version, operationId: getProfile, responses: { '200': { $ref: '#/components/responses/Resource' }, '4XX': { $ref: '#/components/responses/Error' }, default: { $ref: '#/components/responses/Error' } } }
+  /policies:
+    get: { summary: List policies, operationId: listPolicies, responses: { '200': { $ref: '#/components/responses/ResourcePage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /policies/{policy_id}/versions/{version}:
+    parameters:
+      - { name: policy_id, in: path, required: true, schema: { type: string } }
+      - { name: version, in: path, required: true, schema: { type: string } }
+    get: { summary: Get a policy version, operationId: getPolicy, responses: { '200': { $ref: '#/components/responses/Resource' }, '4XX': { $ref: '#/components/responses/Error' }, default: { $ref: '#/components/responses/Error' } } }
+  /extensions:
+    get: { summary: List extensions, operationId: listExtensions, responses: { '200': { $ref: '#/components/responses/EmptyPage' }, '4XX': { $ref: '#/components/responses/Error' } } }
+  /extensions/{extension_id}/versions/{version}:
+    parameters:
+      - { name: extension_id, in: path, required: true, schema: { type: string } }
+      - { name: version, in: path, required: true, schema: { type: string } }
+    get: { summary: Get an extension version, operationId: getExtension, responses: { '4XX': { $ref: '#/components/responses/Error' }, default: { $ref: '#/components/responses/Error' } } }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    SubmissionId: { name: submission_id, in: path, required: true, schema: { type: string } }
+  responses:
+    SubmissionAccepted:
+      description: Accepted durable request
+      content: { application/json: { schema: { $ref: '#/components/schemas/SubmissionAccepted' } } }
+    Error:
+      description: Stable API error
+      content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } }
+    EmptyPage:
+      description: Empty page for an unsupported resource family
+      content: { application/json: { schema: { $ref: '#/components/schemas/Page' } } }
+    ResourcePage:
+      description: Resource page
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Page'
+              - type: object
+                properties: { items: { type: array, items: { $ref: '#/components/schemas/ResourceSummary' } } }
+    Resource:
+      description: Immutable resource version
+      content: { application/json: { schema: { $ref: '#/components/schemas/ResourceSummary' } } }
+  schemas:
+    SubmissionCreate:
+      type: object
+      additionalProperties: false
+      required: [input]
+      properties:
+        client_reference: { type: string }
+        labels: { type: object, additionalProperties: { type: string } }
+        mode: { $ref: '#/components/schemas/TaskMode' }
+        input: { $ref: '#/components/schemas/Input' }
+        workspace: { $ref: '#/components/schemas/WorkspaceRef' }
+        output: { $ref: '#/components/schemas/OutputSpec' }
+        agent: { $ref: '#/components/schemas/AgentSelector' }
+        execution: { $ref: '#/components/schemas/ExecutionSelector' }
+        session: { $ref: '#/components/schemas/SessionBinding' }
+        scheduling: { $ref: '#/components/schemas/Scheduling' }
+        limits: { $ref: '#/components/schemas/Limits' }
+        policy: { $ref: '#/components/schemas/ResourceSelector' }
+    TaskMode:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind]
+          properties: { kind: { const: task } }
+        - type: object
+          additionalProperties: false
+          required: [kind]
+          properties: { kind: { const: goal }, token_budget: { type: integer, minimum: 0 } }
+    Input:
+      type: object
+      additionalProperties: false
+      required: [parts]
+      properties:
+        parts: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ContentPart' } }
+    ContentPart:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, text]
+          properties: { type: { const: text }, text: { type: string } }
+        - type: object
+          additionalProperties: false
+          required: [type, data]
+          properties: { type: { const: data }, data: {}, media_type: { type: string } }
+        - type: object
+          additionalProperties: false
+          required: [type, file]
+          properties: { type: { const: file }, file: { type: object }, name: { type: string }, media_type: { type: string } }
+    WorkspaceRef:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, root_id]
+          properties:
+            kind: { const: local }
+            root_id: { type: string }
+            path: { type: string }
+            revision: { type: string }
+            access: { $ref: '#/components/schemas/WorkspaceAccess' }
+        - type: object
+          additionalProperties: false
+          required: [kind, binding_id, revision]
+          properties:
+            kind: { const: binding }
+            binding_id: { type: string }
+            revision: { type: string }
+            access: { enum: [read_only, writable_overlay] }
+    WorkspaceAccess: { enum: [read_only, writable, writable_overlay] }
+    OutputSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        final:
+          oneOf:
+            - type: object
+              required: [kind]
+              properties: { kind: { const: text } }
+            - type: object
+              required: [kind, schema]
+              properties: { kind: { const: json_schema }, schema: {} }
+        artifacts: { type: object }
+    AgentSelector:
+      type: object
+      additionalProperties: false
+      properties:
+        profile: { $ref: '#/components/schemas/ResourceSelector' }
+        adapter: { type: string }
+        model: { type: string }
+        required_capabilities: { type: array, items: { type: object } }
+        extensions: { type: array, items: { type: object } }
+    ExecutionSelector:
+      type: object
+      additionalProperties: false
+      properties:
+        route_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+        target_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+        locality: { enum: [local_only, any] }
+        side_effects: { enum: [read_only, idempotent_write, side_effecting] }
+    SessionBinding:
+      oneOf:
+        - type: object
+          required: [mode]
+          properties: { mode: { const: ephemeral } }
+        - type: object
+          required: [mode]
+          properties: { mode: { const: create }, retention_seconds: { type: integer, minimum: 0 } }
+        - type: object
+          required: [mode, session_id]
+          properties: { mode: { const: resume }, session_id: { type: string } }
+    Scheduling:
+      type: object
+      additionalProperties: false
+      properties:
+        priority: { type: integer, minimum: 0, maximum: 100, default: 50 }
+        not_before: { type: string, format: date-time }
+        start_deadline: { type: string, format: date-time }
+    Limits:
+      type: object
+      additionalProperties: false
+      properties:
+        run_timeout_seconds: { type: integer, minimum: 0 }
+        idle_timeout_seconds: { type: integer, minimum: 0 }
+        max_tokens: { type: integer, minimum: 0 }
+        max_provider_requests: { type: integer, minimum: 0 }
+    ResourceSelector:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties: { id: { type: string }, version: { type: string } }
+    ResourceRef:
+      type: object
+      required: [id, version, digest]
+      properties: { id: { type: string }, version: { type: string }, digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+    RuntimeRef:
+      type: object
+      required: [name, version, digest]
+      properties: { name: { const: sandbox-agent }, version: { type: string }, digest: { type: string } }
+    SubmissionAccepted:
+      type: object
+      required: [submission_id, state, terminal, revision, request_digest, resolved_profile, resolved_policy, status_url, events_url, result_url, idempotent_replay]
+      properties:
+        submission_id: { type: string }
+        state: { const: queued }
+        terminal: { const: false }
+        revision: { type: integer }
+        request_digest: { type: string }
+        resolved_profile: { $ref: '#/components/schemas/ResourceRef' }
+        resolved_policy: { $ref: '#/components/schemas/ResourceRef' }
+        status_url: { type: string }
+        events_url: { type: string }
+        result_url: { type: string }
+        idempotent_replay: { type: boolean }
+    SubmissionStatus:
+      type: object
+      required: [submission_id, request_digest, resolved_profile, resolved_policy, state, terminal, revision, mode, created_at, updated_at, attempts, latest_event_sequence]
+      properties:
+        submission_id: { type: string }
+        client_reference: { type: string }
+        request_digest: { type: string }
+        resolved_profile: { $ref: '#/components/schemas/ResourceRef' }
+        resolved_policy: { $ref: '#/components/schemas/ResourceRef' }
+        state: { $ref: '#/components/schemas/SubmissionState' }
+        terminal: { type: boolean }
+        revision: { type: integer }
+        mode: { enum: [task, goal] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        blocker: { type: object }
+        session_id: { type: string }
+        attempts: { type: array, items: { $ref: '#/components/schemas/Attempt' } }
+        latest_event_sequence: { type: integer }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+    SubmissionState: { enum: [queued, running, completed, failed, cancelled, expired, uncertain] }
+    Attempt:
+      type: object
+      required: [attempt_id, number, state, route_id, adapter, model, target_id, source_label, sandbox_profile, runtime]
+      properties:
+        attempt_id: { type: string }
+        number: { type: integer }
+        state: { enum: [starting, running, completed, failed, cancelled, uncertain] }
+        route_id: { type: string }
+        adapter: { type: string }
+        model: { type: string }
+        target_id: { type: string }
+        source_label: { type: string }
+        sandbox_profile: { type: string }
+        runtime: { $ref: '#/components/schemas/RuntimeRef' }
+        agent_version: { type: string }
+        session_id: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        usage: { type: object }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+    EventEnvelope:
+      type: object
+      required: [event_id, submission_id, sequence, occurred_at, type, data]
+      properties:
+        event_id: { type: string }
+        submission_id: { type: string }
+        session_id: { type: string }
+        attempt_id: { type: string }
+        sequence: { type: integer }
+        occurred_at: { type: string, format: date-time }
+        type: { type: string }
+        data: { type: object }
+    SubmissionResult:
+      type: object
+      required: [submission_id, state, terminal, artifacts, attempts, finished_at]
+      properties:
+        submission_id: { type: string }
+        state: { $ref: '#/components/schemas/SubmissionState' }
+        terminal: { const: true }
+        output: { type: object }
+        artifacts: { type: array, items: { type: object } }
+        attempts: { type: array, items: { $ref: '#/components/schemas/Attempt' } }
+        usage: { type: object }
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+        finished_at: { type: string, format: date-time }
+    SubmissionPatch:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        priority: { type: integer, minimum: 0, maximum: 100 }
+        not_before: { type: [string, 'null'], format: date-time }
+        start_deadline: { type: [string, 'null'], format: date-time }
+    CancellationResult:
+      type: object
+      required: [submission_id, disposition, revision]
+      properties:
+        submission_id: { type: string }
+        disposition: { enum: [cancelled, cancellation_requested, already_terminal, delivery_unknown] }
+        revision: { type: integer }
+    CapabilityCatalog:
+      type: object
+      required: [capabilities]
+      properties: { capabilities: { type: array, items: { type: object } } }
+    ResourceSummary:
+      type: object
+      required: [ref, capabilities, deprecated]
+      properties:
+        ref: { $ref: '#/components/schemas/ResourceRef' }
+        description: { type: string }
+        capabilities: { type: array, items: { type: object } }
+        deprecated: { type: boolean }
+    Page:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array }, next_cursor: { type: [string, 'null'] } }
+    ApiError:
+      type: object
+      required: [request_id, error]
+      properties: { request_id: { type: string }, error: { $ref: '#/components/schemas/ErrorDetail' } }
+    ErrorDetail:
+      type: object
+      required: [code, message, retryable, scope]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        retryable: { type: boolean }
+        retry_after_seconds: { type: integer }
+        scope: { enum: [request, submission, attempt, route, target, source, session] }
+        field: { type: string }

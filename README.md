@@ -14,7 +14,19 @@
 
 后台任务默认在系统级 sandbox 内以 YOLO/auto-approve 运行，不逐项等待权限确认；sandbox 外的文件、网络、secret 与副作用边界仍由 runner 强制拒绝。真正需要业务输入的任务以 `interaction_required` 结束，source 登录或 MFA 则单独报告 `source_auth_required`。
 
-项目使用 Rust 实现控制面和 runner；v1 统一使用 Sandbox Agent 作为 Agent runtime，本机修改版 OpenCode 的 goal 能力通过局部 adapter patch 接入。
+项目使用 Rust 实现控制面和 runner；v1 统一使用 Sandbox Agent 作为 Agent runtime。本机修改版 OpenCode 的 goal 能力只会通过局部 adapter patch 接入，并在通过能力探测和 conformance 前保持关闭。
+
+当前 `0.1` 已实现本机 OpenCode task：UDS HTTP API、SQLite 持久队列、priority/aging、静态或命令容量探测、bubblewrap sandbox、事件/结果/取消，以及固定 Sandbox Agent 的下载校验。goal、持久 session、Extension、远程 runner 和 artifact/object transport 仍按 v1 协议保留，但在能力发布前会明确拒绝。
+
+```text
+cargo build --workspace
+eyes init --workspace-root /absolute/project/root
+eyes doctor
+thieving-eyesd
+eyes run --workspace /absolute/project "完成后台任务"
+```
+
+`eyes init` 是显式安装步骤：它从 Sandbox Agent 官方 release 分发地址取得固定版本并校验 SHA-256；daemon 不会在接收任务时临时安装 runtime 或 Agent。
 
 ## 文档
 

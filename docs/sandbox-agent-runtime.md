@@ -2,7 +2,7 @@
 
 本文件固定 thieving-eyes v1 与 [Sandbox Agent](https://github.com/rivet-dev/sandbox-agent) 的内部协议边界。Sandbox Agent 是 v1 唯一的通用 Agent runtime；这不是可由 Submission 直接调用的第二套公共 API。
 
-本文设计核对过 Sandbox Agent `0.4.2` 及上游 revision `bbc195cc3fb5a1dd9cb05d8437442768c511e17e`。实现时必须固定一个通过 conformance suite 的 release、commit 与二进制 digest；这里记录的版本不是自动升级规则。
+本文设计核对过 Sandbox Agent `0.4.2` 及上游 revision `bbc195cc3fb5a1dd9cb05d8437442768c511e17e`。`0.1` 的 Linux x86_64 安装物来自官方 `https://releases.rivet.dev/sandbox-agent/0.4.2/binaries/sandbox-agent-x86_64-unknown-linux-musl`，固定 SHA-256 为 `bab098abef874ade481aa7b50463662814fbf27294399f545307fedb638f029b`。升级必须同时更新 release、revision、平台 digest 和 conformance 结果，不能跟随 `main`。
 
 ## 1. 部署与所有权
 
@@ -21,13 +21,13 @@ thieving-eyes-runner supervisor
 
 Sandbox Agent 只监听 sandbox network namespace 内的随机 loopback 端口，并使用每次启动生成的高熵 token。只有 worker 持有 endpoint/token；它们不进入 supervisor 持久状态、daemon、DispatchGrant、事件或日志。runtime 不监听宿主或 target 的公网接口。
 
-Agent binary 与 Sandbox Agent 必须在 target image/安装阶段预置并固定版本。任务执行时不得使用 Sandbox Agent 的 lazy install、任意上传或 credential extraction 作为兜底；缺失二进制时该 target 不发布对应 capability。
+Agent binary 与 Sandbox Agent 必须在 target image/安装阶段预置并固定版本。个人安装由 `eyes init` 显式下载和校验官方固定二进制，`eyes doctor` 再核对 Sandbox Agent、OpenCode digest/version 与 bubblewrap；daemon 启动和任务执行阶段不得 lazy install、任意上传或使用 credential extraction 兜底，缺失二进制时 target 不发布对应 capability。
 
 thieving-eyes 原生拥有队列、Attempt、Session metadata、持久事件、重试、容量和结果。Sandbox Agent 拥有当前 runtime instance 内的 Agent 进程、ACP connection 与 provider session 操作，但其内存状态不是权威存储。
 
 ## 2. 使用的上游协议面
 
-Rust runner 实现窄的 Sandbox Agent HTTP/ACP client，不嵌入其 TypeScript SDK。只依赖以下上游协议面：
+Rust runner 实现窄的 Sandbox Agent HTTP/ACP client，不把 TypeScript runtime 或 Node/Bun 引入生产执行链。官方 TypeScript SDK 用作传输语义和 conformance 参考；Rust client 必须跟随其 POST request/response、SSE 顺序、认证与关闭行为。只依赖以下上游协议面：
 
 - `GET /v1/health`：runtime readiness；
 - `GET /v1/agents?config=true`：Agent 安装版本和静态 capability 探测；

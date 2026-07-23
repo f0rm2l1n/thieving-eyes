@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+  "bins/eyes",
+  "bins/thieving-eyes-runner",
+  "bins/thieving-eyesd",
+  "crates/protocol",
+  "crates/runner",
+  "crates/runtime-sandbox-agent",
+  "crates/service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = { version = "0.8.7", features = ["json", "macros"] }
+bytes = "1.11.0"
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.53", features = ["derive"] }
+eventsource-stream = "0.2.3"
+futures = "0.3.31"
+hex = "0.4.3"
+http = "1.4.0"
+http-body-util = "0.1.3"
+hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.19", features = ["client-legacy", "http1", "server", "tokio"] }
+nix = { version = "0.30.1", features = ["socket", "user"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_jcs = "0.2.0"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["chrono", "macros", "migrate", "runtime-tokio-rustls", "sqlite"] }
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+toml = "0.9.8"
+tower = { version = "0.5.2", features = ["util"] }
+tower-http = { version = "0.6.7", features = ["trace"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+ulid = { version = "1.2.1", features = ["serde"] }
+url = "2.5.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

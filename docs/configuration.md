@@ -29,7 +29,7 @@ Profile 分开定义 Agent 层审批与系统层隔离。推荐默认值是 `int
 
 ## 简单配置
 
-个人项目只需一个本机 target、一个 source、默认 route/profile/policy、允许 workspace root 和 sandbox profile。下面只表示最小资源关系，不固定未来 TOML 的表名：
+个人项目只需一个本机 target、一个 source、默认 route/profile/policy、允许 workspace root 和 sandbox profile。`eyes init --workspace-root <absolute-path>` 会生成当前版本的完整 TOML；下面只表示稳定资源关系，不替代生成配置：
 
 ```text
 database = local SQLite
@@ -59,7 +59,7 @@ workspace_bindings = [tunascope_runner_a, brainafk_runner_b]
 
 每个 route 必须明确：adapter/model 约束、source pool、允许 target/runtime、fallback 顺序与必需 capability。每个 source 必须明确：配置并发上限、safety reserve、容量观测方式和 cooldown policy。每个 SourceBinding 必须明确：target、credential resolver reference、允许 runtime 和隔离要求。
 
-长期 credential、OAuth cache、HOME 路径、MCP secret 和 mirror remote URL 不写入 daemon-facing 配置；这里只保存 target-local resolver/binding ID。
+长期 credential 内容、OAuth token、MCP secret 和 mirror credential 不写入 daemon-facing 配置；这里只保存 target-local resolver/binding。`0.1` 的本机文件 resolver 可由管理员配置受限的 credential 文件路径，但 daemon 不读取内容、不写入 SQLite，runner 只把选中 Source 的文件只读挂载到本 Attempt 的隔离 HOME。
 
 ## 解析与变更
 

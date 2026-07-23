@@ -1,0 +1,21 @@
+[package]
+name = "thieving-eyes-runner-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "thieving-eyes-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+thieving-eyes-runner = { path = "../../crates/runner" }
+thieving-eyes-runtime-sandbox-agent = { path = "../../crates/runtime-sandbox-agent" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
