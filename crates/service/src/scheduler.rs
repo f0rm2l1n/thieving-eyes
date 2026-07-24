@@ -324,6 +324,11 @@ async fn run_attempt(
             sandbox_path: mapping.sandbox_path.clone(),
         })
         .collect();
+    let inherit_proxy_environment = context
+        .config
+        .local_source_binding(&dispatch.source_id)
+        .map(|binding| binding.inherit_proxy_environment.clone())
+        .unwrap_or_default();
     let runner_request = RunnerRequest {
         attempt_id: attempt_id.clone(),
         sandbox_agent_path: context.config.sandbox_agent_path(),
@@ -335,6 +340,7 @@ async fn run_attempt(
         workspace_writable: writable,
         network_enabled: submission.profile.network == NetworkMode::Inherited,
         credential_mounts,
+        inherit_proxy_environment,
         prompt,
         model: dispatch.model,
         run_timeout_seconds: run_timeout,

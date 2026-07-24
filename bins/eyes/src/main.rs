@@ -173,6 +173,7 @@ async fn init(
             config_path.display()
         );
     }
+    let config_dir = config_path.parent().context("config path has no parent")?;
     let workspace_root = tokio::fs::canonicalize(&workspace_root)
         .await
         .with_context(|| format!("resolve workspace root {}", workspace_root.display()))?;
@@ -192,21 +193,45 @@ async fn init(
     let data_dir = default_data_dir()?;
     let runtime_dir = default_runtime_dir()?;
     let home = home_dir()?;
+    tokio::fs::create_dir_all(config_dir).await?;
+    set_private_dir(config_dir).await?;
+    let source_config_dir = config_dir.join("opencode/default");
+    tokio::fs::create_dir_all(&source_config_dir).await?;
+    if let Some(source_config_root) = source_config_dir.parent() {
+        set_private_dir(source_config_root).await?;
+    }
+    set_private_dir(&source_config_dir).await?;
     let mut credential_files = Vec::new();
-    for (host, sandbox) in [
+    for (discovered, independent, sandbox) in [
         (
             home.join(".local/share/opencode/auth.json"),
+            source_config_dir.join("auth.json"),
             PathBuf::from(".local/share/opencode/auth.json"),
         ),
         (
             home.join(".config/opencode/opencode.jsonc"),
+            source_config_dir.join("opencode.jsonc"),
             PathBuf::from(".config/opencode/opencode.jsonc"),
         ),
     ] {
-        if tokio::fs::try_exists(&host).await? {
+        if !tokio::fs::try_exists(&independent).await? && tokio::fs::try_exists(&discovered).await?
+        {
+            tokio::fs::copy(&discovered, &independent)
+                .await
+                .with_context(|| {
+                    format!(
+                        "import OpenCode file {} into {}",
+                        discovered.display(),
+                        independent.display()
+                    )
+                })?;
+            set_private(&independent).await?;
+        }
+        if tokio::fs::try_exists(&independent).await? {
+            set_private(&independent).await?;
             credential_files.push(CredentialFile {
                 source_id: "default".to_owned(),
-                host_path: host,
+                host_path: independent,
                 sandbox_path: sandbox,
             });
         }
@@ -227,6 +252,7 @@ async fn init(
             opencode_binary: opencode,
             opencode_sha256,
             credential_files,
+            source_bindings: Vec::new(),
         },
         defaults: Defaults {
             profile_id: "local_coding".to_owned(),
@@ -267,10 +293,8 @@ async fn init(
         }],
     };
     config.validate()?;
-    let parent = config_path.parent().context("config path has no parent")?;
-    tokio::fs::create_dir_all(parent).await?;
     let encoded = toml::to_string_pretty(&config)?;
-    let temporary = parent.join(format!(".config-{}.tmp", Ulid::new()));
+    let temporary = config_dir.join(format!(".config-{}.tmp", Ulid::new()));
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -281,7 +305,7 @@ async fn init(
     drop(file);
     set_private(&temporary).await?;
     if tokio::fs::try_exists(config_path).await? {
-        let backup = parent.join(format!("config.toml.backup-{}", Ulid::new()));
+        let backup = config_dir.join(format!("config.toml.backup-{}", Ulid::new()));
         tokio::fs::rename(config_path, backup).await?;
     }
     tokio::fs::rename(temporary, config_path).await?;
@@ -366,6 +390,20 @@ async fn submit(config: &Config, task: TaskArgs) -> Result<SubmissionAccepted> {
     if task.priority > 100 {
         bail!("priority must be between 0 and 100");
     }
+    let route_ids = task.model.as_deref().map(|model| {
+        config
+            .routes
+            .iter()
+            .filter(|route| route.model.is_empty() || route.model == model)
+            .map(|route| route.id.clone())
+            .collect::<Vec<_>>()
+    });
+    if route_ids.as_ref().is_some_and(Vec::is_empty) {
+        bail!(
+            "no configured route supports model {}",
+            task.model.as_deref().unwrap_or_default()
+        );
+    }
     let workspace = match task.workspace {
         Some(path) => Some(resolve_workspace(config, &path, task.write).await?),
         None => None,
@@ -389,7 +427,7 @@ async fn submit(config: &Config, task: TaskArgs) -> Result<SubmissionAccepted> {
                 extensions: Vec::new(),
             }),
         execution: Some(ExecutionSelector {
-            route_ids: None,
+            route_ids,
             target_ids: Some(vec!["local".to_owned()]),
             locality: Some(thieving_eyes_protocol::Locality::LocalOnly),
             side_effects: Some(if task.write {
@@ -595,6 +633,15 @@ async fn set_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut permissions = tokio::fs::metadata(path).await?.permissions();
     permissions.set_mode(0o600);
+    tokio::fs::set_permissions(path, permissions).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = tokio::fs::metadata(path).await?.permissions();
+    permissions.set_mode(0o700);
     tokio::fs::set_permissions(path, permissions).await?;
     Ok(())
 }

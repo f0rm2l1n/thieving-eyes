@@ -507,11 +507,29 @@ async fn drive_prompt(
             response = &mut prompt_task, if !prompt_post_finished => {
                 prompt_post_finished = true;
                 let response = response.context("join ACP prompt task")??;
-                if response
-                    .as_ref()
-                    .is_some_and(|response| !is_response_for(response, 4))
-                {
-                    bail!("ACP prompt POST returned an unrelated response envelope");
+                if let Some(response) = response {
+                    if !is_response_for(&response, 4) {
+                        bail!("ACP prompt POST returned an unrelated response envelope");
+                    }
+                    break match wait_for_prompt_response(
+                        client,
+                        token,
+                        events,
+                        &mut session,
+                        &mut output,
+                        request.max_output_bytes,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    {
+                        Ok(streamed_response) => {
+                            completion_from_response(&streamed_response, output)
+                        }
+                        Err(error) => {
+                            debug!(%error, "ACP SSE did not mirror the completed prompt response");
+                            completion_from_response(&response, output)
+                        }
+                    };
                 }
             }
         }
@@ -712,7 +730,7 @@ async fn wait_for_prompt_response(
         }
     })
     .await
-    .context("Agent stop confirmation timeout")?
+    .context("ACP prompt response timeout")?
 }
 
 fn is_response_for(value: &Value, request_id: u64) -> bool {

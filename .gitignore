@@ -1,5 +1,11 @@
 /target/
 /.cache/
+/config.toml
+/config.toml.backup-*
+/opencode/
+.env
+.env.*
+!.env.example
 *.db
 *.db-shm
 *.db-wal

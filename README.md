@@ -24,6 +24,7 @@ eyes init --workspace-root /absolute/project/root
 eyes doctor
 thieving-eyesd
 eyes run --workspace /absolute/project "完成后台任务"
+eyes run --model provider/model "使用已配置 route 的模型"
 ```
 
 `eyes init` 是显式安装步骤：它从 Sandbox Agent 官方 release 分发地址取得固定版本并校验 SHA-256；daemon 不会在接收任务时临时安装 runtime 或 Agent。

@@ -19,7 +19,7 @@ v1 使用 TOML 配置文件，不提供第二套数据库配置 UI。个人模�
 
 `Source` 才代表需要监控和 lease 的全局算力来源。多个 source 可以属于同一个 route；调用方选择 route/model，不能选择具体账号或 credential。
 
-同一个 Source 可以在多个 target 上有 SourceBinding，但它们共享 daemon 中同一份并发、额度、cooldown 和 active lease 计数，不能被当成多份容量。每个 binding 只保存 target-local secret resolver ID、允许的 runtime 与 execution-domain 约束。
+同一个 Source 可以在多个 target 上有 SourceBinding，但它们共享 daemon 中同一份并发、额度、cooldown 和 active lease 计数，不能被当成多份容量。每个 binding 只保存 target-local secret resolver ID、允许的 runtime 与 execution-domain 约束。`0.1` 本机 binding 还可以声明需要从 runner 宿主环境继承的代理变量名；固定白名单仅包含大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`，其值不进入 Submission、SQLite 或日志。
 
 `Runtime` 不是 provider，也不是 route。v1 的 runtime kind 固定为 Sandbox Agent；不同 Runtime 资源只表示经过验证的上游版本、二进制 digest 与窄 patch set。普通 route 使用标准 build；OpenCode goal route 使用通过 `core.native_goal` conformance 的 patched build。
 
@@ -44,7 +44,9 @@ allowed_workspace_roots = [/home/user/projects]
 local_coding = non_interactive + auto_allow + required_sandbox + deny_escape
 ```
 
-`thieving-eyesd` 自动监管本机 runner；项目只提交 text part 和可选本机 workspace。调用方无需了解 source、lease、runtime、mirror 或 grant。
+`thieving-eyesd` 自动监管本机 runner；项目只提交 text part 和可选本机 workspace。调用方无需了解 source、lease、runtime、mirror 或 grant。`eyes init` 会把发现到的 OpenCode 配置和 auth 文件一次性导入 `thieving-eyes/opencode/default/`，后续 Attempt 只引用这份服务私有快照，不直接复用用户日常的 OpenCode 目录；credential 更新需要由管理员同步到该目录。
+
+CLI 显式使用 `--model provider/model` 时，会把配置中匹配该模型的 route 作为 Submission 约束；没有匹配 route 时在提交前失败。省略 `--model` 时仍使用默认 route。
 
 ## 扩展配置
 
@@ -62,6 +64,21 @@ workspace_bindings = [tunascope_runner_a, brainafk_runner_b]
 每个 route 必须明确：adapter/model 约束、source pool、允许 target/runtime、fallback 顺序与必需 capability。每个 source 必须明确：配置并发上限、safety reserve、容量观测方式和 cooldown policy。每个 SourceBinding 必须明确：target、credential resolver reference、允许 runtime 和隔离要求。
 
 长期 credential 内容、OAuth token、MCP secret 和 mirror credential 不写入 daemon-facing 配置；这里只保存 target-local resolver/binding。`0.1` 的本机文件 resolver 可由管理员配置受限的 credential 文件路径，但 daemon 不读取内容、不写入 SQLite，runner 只把选中 Source 的文件只读挂载到本 Attempt 的隔离 HOME。
+
+本机需要代理的 Source 可以使用受控绑定：
+
+```toml
+[[local_runner.source_bindings]]
+source_id = "deepseek"
+inherit_proxy_environment = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+]
+```
+
+这些名称由配置加载器严格校验，不能改成 provider key、任意环境变量或由 Submission 指定。runner 在目标机启动 Attempt 时读取实际值，并在清空沙箱环境后只传递列出的已存在变量。不同 Source 应分别配置 binding；不需要代理的 Source 保持空列表或省略 binding。
 
 ## 解析与变更
 

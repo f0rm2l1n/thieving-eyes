@@ -28,6 +28,7 @@ pub struct RunnerRequest {
     pub workspace_writable: bool,
     pub network_enabled: bool,
     pub credential_mounts: Vec<CredentialMount>,
+    pub inherit_proxy_environment: Vec<String>,
     pub prompt: String,
     pub model: Option<String>,
     pub run_timeout_seconds: u64,
@@ -180,6 +181,7 @@ pub async fn supervisor() -> Result<()> {
                 workspace_writable: request.workspace_writable,
                 network_enabled: request.network_enabled,
                 credential_mounts: Vec::new(),
+                inherit_proxy_environment: Vec::new(),
                 prompt: request.prompt,
                 model: request.model,
                 run_timeout_seconds: request.run_timeout_seconds,
@@ -314,6 +316,16 @@ async fn spawn_bubblewrap_worker(request: &RunnerRequest, scratch: &TempDir) -> 
     let paths = prepare_sandbox_paths(request, scratch).await?;
     let mut command = Command::new(&request.bubblewrap_path);
     command.env_clear();
+    if request.network_enabled {
+        for name in &request.inherit_proxy_environment {
+            if !is_allowed_proxy_environment(name) {
+                bail!("runner rejected inherited environment variable {name}");
+            }
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
     configure_base_bubblewrap(&mut command, &paths, request.network_enabled);
 
     if request.workspace_writable {
@@ -363,6 +375,20 @@ async fn spawn_bubblewrap_worker(request: &RunnerRequest, scratch: &TempDir) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     command.spawn().context("start bubblewrap worker")
+}
+
+fn is_allowed_proxy_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "all_proxy"
+            | "no_proxy"
+    )
 }
 
 async fn prepare_sandbox_paths(request: &RunnerRequest, scratch: &TempDir) -> Result<SandboxPaths> {
@@ -531,5 +557,13 @@ mod tests {
     fn sandbox_mount_destination_is_relative() {
         assert!(validate_sandbox_relative(Path::new(".local/share/opencode/auth.json")).is_ok());
         assert!(validate_sandbox_relative(Path::new("../../etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn sandbox_only_inherits_proxy_environment() {
+        assert!(is_allowed_proxy_environment("HTTP_PROXY"));
+        assert!(is_allowed_proxy_environment("no_proxy"));
+        assert!(!is_allowed_proxy_environment("PATH"));
+        assert!(!is_allowed_proxy_environment("DEEPSEEK_API_KEY"));
     }
 }

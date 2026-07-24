@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::path::{Component, PathBuf};
 
@@ -291,7 +291,14 @@ async fn result(
     }
 }
 
-async fn capabilities() -> Json<CapabilityCatalog> {
+async fn capabilities(State(state): State<ServiceState>) -> Json<CapabilityCatalog> {
+    let models = state
+        .config
+        .routes
+        .iter()
+        .filter(|route| route.adapter == "opencode" && !route.model.is_empty())
+        .map(|route| route.model.clone())
+        .collect::<BTreeSet<_>>();
     Json(CapabilityCatalog {
         capabilities: vec![
             capability("core.task", BTreeMap::new()),
@@ -302,7 +309,10 @@ async fn capabilities() -> Json<CapabilityCatalog> {
             capability("core.events.sse", BTreeMap::new()),
             capability(
                 "agent.opencode",
-                BTreeMap::from([("mode".to_owned(), json!(["task"]))]),
+                BTreeMap::from([
+                    ("mode".to_owned(), json!(["task"])),
+                    ("models".to_owned(), json!(models)),
+                ]),
             ),
             capability("sandbox.bubblewrap", BTreeMap::new()),
         ],

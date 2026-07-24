@@ -54,6 +54,8 @@ pub struct LocalRunnerConfig {
     pub opencode_sha256: String,
     #[serde(default)]
     pub credential_files: Vec<CredentialFile>,
+    #[serde(default)]
+    pub source_bindings: Vec<LocalSourceBindingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +64,14 @@ pub struct CredentialFile {
     pub source_id: String,
     pub host_path: PathBuf,
     pub sandbox_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSourceBindingConfig {
+    pub source_id: String,
+    #[serde(default)]
+    pub inherit_proxy_environment: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +281,34 @@ impl Config {
                 );
             }
         }
+        ensure_unique(
+            self.local_runner
+                .source_bindings
+                .iter()
+                .map(|binding| binding.source_id.as_str()),
+            "local source binding",
+        )?;
+        for binding in &self.local_runner.source_bindings {
+            if !source_ids.contains(binding.source_id.as_str()) {
+                bail!(
+                    "local source binding references unknown source {}",
+                    binding.source_id
+                );
+            }
+            ensure_unique(
+                binding.inherit_proxy_environment.iter().map(String::as_str),
+                "inherited proxy environment variable",
+            )?;
+            for name in &binding.inherit_proxy_environment {
+                if !is_allowed_proxy_environment(name) {
+                    bail!(
+                        "local source binding {} cannot inherit environment variable {}",
+                        binding.source_id,
+                        name
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -300,6 +338,14 @@ impl Config {
     #[must_use]
     pub fn source(&self, id: &str) -> Option<&SourceConfig> {
         self.sources.iter().find(|source| source.id == id)
+    }
+
+    #[must_use]
+    pub fn local_source_binding(&self, source_id: &str) -> Option<&LocalSourceBindingConfig> {
+        self.local_runner
+            .source_bindings
+            .iter()
+            .find(|binding| binding.source_id == source_id)
     }
 
     #[must_use]
@@ -387,6 +433,20 @@ fn validate_relative_sandbox_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_allowed_proxy_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "all_proxy"
+            | "no_proxy"
+    )
+}
+
 const fn default_inline_output_bytes() -> usize {
     262_144
 }
@@ -437,7 +497,7 @@ const fn default_allow_writable() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_relative_sandbox_path;
+    use super::{is_allowed_proxy_environment, validate_relative_sandbox_path};
     use std::path::Path;
 
     #[test]
@@ -447,5 +507,13 @@ mod tests {
         );
         assert!(validate_relative_sandbox_path(Path::new("../auth.json")).is_err());
         assert!(validate_relative_sandbox_path(Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn inherited_environment_is_limited_to_proxy_variables() {
+        assert!(is_allowed_proxy_environment("HTTPS_PROXY"));
+        assert!(is_allowed_proxy_environment("no_proxy"));
+        assert!(!is_allowed_proxy_environment("PATH"));
+        assert!(!is_allowed_proxy_environment("OPENAI_API_KEY"));
     }
 }

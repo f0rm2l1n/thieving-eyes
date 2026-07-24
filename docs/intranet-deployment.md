@@ -50,7 +50,7 @@ curl -fsSI \
   >/dev/null
 ```
 
-OpenCode 的运行时网络与构建网络是两个边界。runner 会清空宿主环境，只显式建立 sandbox HOME、XDG 和 PATH；它不会把 daemon 的 `HTTP_PROXY`、`HTTPS_PROXY` 或任意 provider 环境变量传入 Agent。provider 若要求代理，应优先在内网网关、DNS、OpenCode 固定配置或系统网络层解决。若必须注入代理环境变量，需要先实现管理员控制、按 SourceBinding 冻结的环境白名单，不能让 Submission 自由提供。
+OpenCode 的运行时网络与构建网络是两个边界。runner 会清空宿主环境，只显式建立 sandbox HOME、XDG、PATH，以及当前 SourceBinding 明确列出的代理变量。provider 若要求代理，在 `[[local_runner.source_bindings]]` 中配置 `inherit_proxy_environment`；允许值仅为大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。实际值必须由目标机服务环境提供，不写入 Submission 或 daemon 配置，也不能用于注入 provider key 等任意变量。
 
 ## 4. Rustup 镜像
 
@@ -221,6 +221,22 @@ download_if_missing = false
 ```
 
 OpenCode credential/config 由 `[[local_runner.credential_files]]` 引用，以 `0600` 保存并只读挂载进每个 Attempt。不要把 token 写入 Source、Route、capacity probe 参数或 systemd `ExecStart`。
+
+建议为 thieving-eyes 单独维护 OpenCode 配置目录，例如
+`/var/lib/thieving-eyes/secrets/opencode/<source>/opencode.jsonc`，不要引用服务用户日常使用的
+`~/.config/opencode`。每个 Source 只挂载自己的配置文件，从而避免 provider、模型和 credential
+在账号之间意外串用。
+
+若 Agent 访问 provider 需要代理，可让 systemd 从目标机受限文件读取代理环境，再由 SourceBinding
+白名单选择性传入沙箱：
+
+```ini
+[Service]
+EnvironmentFile=-/etc/thieving-eyes/proxy.env
+```
+
+`proxy.env` 权限应为 `0600`，只包含所需代理变量；若代理 URL 内含认证信息，应按 credential
+对待。修改后重启服务，并用对应 route 的真实任务验证，不能只依赖宿主机上的 `curl`。
 
 当前 daemon 处理 SIGINT 以执行受控关机，尚未单独处理 SIGTERM。systemd unit 应设置：
 
