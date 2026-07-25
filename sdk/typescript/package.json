@@ -1,0 +1,41 @@
+{
+  "name": "@thieving-eyes/sdk",
+  "version": "0.1.0",
+  "description": "Node.js client for the thieving-eyes Submission API",
+  "type": "module",
+  "license": "Apache-2.0",
+  "sideEffects": false,
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "generate": "openapi-typescript ../../api/openapi.yaml --output src/schema.ts --immutable --root-types --root-types-no-schema-prefix --alphabetize --default-non-nullable false",
+    "check:generated": "openapi-typescript ../../api/openapi.yaml --output src/schema.ts --immutable --root-types --root-types-no-schema-prefix --alphabetize --default-non-nullable false --check",
+    "build": "tsc -p tsconfig.json",
+    "check": "pnpm run check:generated && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js",
+    "prepack": "pnpm run check && pnpm run test && pnpm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "openapi-typescript": "7.13.0",
+    "typescript": "^5.7.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "js-yaml": "^4.3.0"
+    }
+  }
+}

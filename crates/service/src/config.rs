@@ -50,12 +50,28 @@ pub struct RuntimeConfig {
 pub struct LocalRunnerConfig {
     pub runner_binary: PathBuf,
     pub bubblewrap_binary: PathBuf,
-    pub opencode_binary: PathBuf,
-    pub opencode_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_sha256: Option<String>,
+    #[serde(default)]
+    pub agent_binaries: Vec<AgentBinaryConfig>,
     #[serde(default)]
     pub credential_files: Vec<CredentialFile>,
     #[serde(default)]
     pub source_bindings: Vec<LocalSourceBindingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBinaryConfig {
+    pub adapter: String,
+    pub binary: PathBuf,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,9 +257,67 @@ impl Config {
                 );
             }
         }
+        ensure_unique(
+            self.local_runner
+                .agent_binaries
+                .iter()
+                .map(|binary| binary.adapter.as_str()),
+            "local Agent binary",
+        )?;
+        if self.local_runner.opencode_binary.is_some()
+            != self.local_runner.opencode_sha256.is_some()
+        {
+            bail!("legacy OpenCode path and digest must be configured together");
+        }
+        for binary in &self.local_runner.agent_binaries {
+            if !matches!(binary.adapter.as_str(), "codex" | "opencode") {
+                bail!(
+                    "local Agent binary has unsupported adapter {}",
+                    binary.adapter
+                );
+            }
+            if binary.agent_process_binary.is_some() != binary.agent_process_sha256.is_some() {
+                bail!(
+                    "local Agent binary {} must configure both agent process path and digest",
+                    binary.adapter
+                );
+            }
+            if !binary.binary.is_absolute()
+                || binary
+                    .agent_process_binary
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute())
+            {
+                bail!(
+                    "local Agent binary {} paths must be absolute",
+                    binary.adapter
+                );
+            }
+            if !is_sha256_hex(&binary.sha256)
+                || binary
+                    .agent_process_sha256
+                    .as_deref()
+                    .is_some_and(|digest| !is_sha256_hex(digest))
+            {
+                bail!(
+                    "local Agent binary {} has an invalid SHA-256 digest",
+                    binary.adapter
+                );
+            }
+            if binary.adapter == "codex" && binary.agent_process_binary.is_none() {
+                bail!("Codex requires a pinned codex-acp Agent process");
+            }
+        }
         for route in &self.routes {
-            if route.adapter != "opencode" {
-                bail!("v0.1 only supports the opencode adapter");
+            if !matches!(route.adapter.as_str(), "codex" | "opencode") {
+                bail!("v0.1 route {} has an unsupported adapter", route.id);
+            }
+            if self.agent_binary(&route.adapter).is_none() {
+                bail!(
+                    "route {} has no configured local Agent binary for {}",
+                    route.id,
+                    route.adapter
+                );
             }
             if route.source_ids.is_empty()
                 || route
@@ -349,6 +423,26 @@ impl Config {
     }
 
     #[must_use]
+    pub fn agent_binary(&self, adapter: &str) -> Option<AgentBinaryConfig> {
+        self.local_runner
+            .agent_binaries
+            .iter()
+            .find(|binary| binary.adapter == adapter)
+            .cloned()
+            .or_else(|| {
+                let binary = self.local_runner.opencode_binary.as_ref()?;
+                let sha256 = self.local_runner.opencode_sha256.as_ref()?;
+                (adapter == "opencode").then(|| AgentBinaryConfig {
+                    adapter: "opencode".to_owned(),
+                    binary: binary.clone(),
+                    sha256: sha256.clone(),
+                    agent_process_binary: None,
+                    agent_process_sha256: None,
+                })
+            })
+    }
+
+    #[must_use]
     pub fn workspace_root(&self, id: &str) -> Option<&WorkspaceRootConfig> {
         self.workspace_roots.iter().find(|root| root.id == id)
     }
@@ -447,6 +541,13 @@ fn is_allowed_proxy_environment(name: &str) -> bool {
     )
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 const fn default_inline_output_bytes() -> usize {
     262_144
 }
@@ -497,7 +598,7 @@ const fn default_allow_writable() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_proxy_environment, validate_relative_sandbox_path};
+    use super::{is_allowed_proxy_environment, is_sha256_hex, validate_relative_sandbox_path};
     use std::path::Path;
 
     #[test]
@@ -515,5 +616,12 @@ mod tests {
         assert!(is_allowed_proxy_environment("no_proxy"));
         assert!(!is_allowed_proxy_environment("PATH"));
         assert!(!is_allowed_proxy_environment("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn binary_digest_is_lowercase_sha256() {
+        assert!(is_sha256_hex(&"a".repeat(64)));
+        assert!(!is_sha256_hex(&"A".repeat(64)));
+        assert!(!is_sha256_hex(&"a".repeat(63)));
     }
 }

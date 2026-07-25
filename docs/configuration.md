@@ -44,9 +44,49 @@ allowed_workspace_roots = [/home/user/projects]
 local_coding = non_interactive + auto_allow + required_sandbox + deny_escape
 ```
 
-`thieving-eyesd` 自动监管本机 runner；项目只提交 text part 和可选本机 workspace。调用方无需了解 source、lease、runtime、mirror 或 grant。`eyes init` 会把发现到的 OpenCode 配置和 auth 文件一次性导入 `thieving-eyes/opencode/default/`，后续 Attempt 只引用这份服务私有快照，不直接复用用户日常的 OpenCode 目录；credential 更新需要由管理员同步到该目录。
+`thieving-eyesd` 自动监管本机 runner；项目只提交 text part 和可选本机 workspace。调用方无需了解 source、lease、runtime、mirror 或 grant。`eyes init` 默认初始化 OpenCode；`eyes init --adapter codex --codex ... --codex-acp ...` 初始化 Codex。它会把所选 Agent 的配置和 auth 文件一次性导入 `thieving-eyes/<adapter>/default/`，后续 Attempt 只引用这份服务私有快照，不直接复用用户日常的 Agent HOME；credential 更新需要由管理员同步到该目录。
 
-CLI 显式使用 `--model provider/model` 时，会把配置中匹配该模型的 route 作为 Submission 约束；没有匹配 route 时在提交前失败。省略 `--model` 时仍使用默认 route。
+CLI 显式使用 `--adapter codex|opencode` 或 `--model provider/model` 时，会把配置中同时匹配这些条件的 route 作为 Submission 约束；没有匹配 route 时在提交前失败。两者都省略时仍使用默认 route。
+
+本机 Agent 安装物使用管理员配置，不进入 Submission：
+
+```toml
+[[local_runner.agent_binaries]]
+adapter = "codex"
+binary = "/opt/thieving-eyes/agents/codex"
+sha256 = "<codex file sha256>"
+agent_process_binary = "/opt/thieving-eyes/agents/codex-acp"
+agent_process_sha256 = "<codex-acp entrypoint sha256>"
+```
+
+`codex-acp` 必须在安装阶段固定为文档指定版本；任务执行阶段不得调用 ACP registry、npm 或 npx。runner 将该 entrypoint 与 Codex binary 只读挂入 sandbox，并显式设置 `CODEX_PATH` 与隔离的 `CODEX_HOME`。daemon 启动时会再次核对 route 所需 Agent binary/process 的 digest；缺失或变更会阻止服务启动，而不是等到任务派发才失败。OpenCode 可以继续使用兼容旧配置的 `opencode_binary`/`opencode_sha256`，新部署应统一使用 `agent_binaries`。
+
+Codex ChatGPT subscription 的模型由管理员作为独立 Route 显式登记；本机当前 catalog 中可用于 API
+的模型是：
+
+```toml
+[[routes]]
+id = "codex_default"
+adapter = "codex"
+model = "gpt-5.6-sol"
+source_ids = ["codex"]
+target_id = "local"
+
+[[routes]]
+id = "codex_gpt_5_6_terra"
+adapter = "codex"
+model = "gpt-5.6-terra"
+source_ids = ["codex"]
+target_id = "local"
+
+# 同样登记 gpt-5.6-luna、gpt-5.5、gpt-5.4、gpt-5.4-mini
+```
+
+因此 `GET /v1/capabilities` 会在 `agent.codex.constraints.models` 中发布这些实际配置的模型。
+模型 catalog 随 Codex release 或订阅权限变化，迁移到另一台机器时应先运行
+`CODEX_HOME=<service-codex-home> codex debug models`，只登记其中
+`supported_in_api=true` 且管理员确实允许使用的模型；不要把隐藏项或 `supported_in_api=false`
+的模型写入 Route。
 
 ## 扩展配置
 

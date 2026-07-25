@@ -24,7 +24,7 @@ thieving-eyes 不创建、拆分、评估或完成 goal；也不从 agent 文本
 
 ## Provider adapter 映射
 
-- **Codex app-server**：adapter 使用 materialized thread 的 `thread/goal/set|get|clear` 和 goal 更新事件，随后以该 thread 的原生 turn/自动继续语义运行。Goal 状态与 token/usage 状态作为 provider 事实转发。
+- **Codex app-server**：adapter 使用 materialized thread 的 `thread/goal/set|get|clear` 和 goal 更新事件，随后以该 thread 的原生 turn/自动继续语义运行。Goal 状态与 token/usage 状态作为 provider 事实转发。当前固定的 `codex-acp` 尚未向 ACP 暴露这组方法，因此普通 Codex task route 不发布 `core.native_goal`；只有窄 adapter extension 与 conformance 完成后才能启用。
 - **Codex TypeScript SDK / `codex exec`**：SDK 可创建/恢复 thread 和运行 turn，但不应被当作原生 goal 控制面。需要 goal mode 的 Gateway 选择 app-server adapter，而不是依赖 prompt 让模型“碰巧”调用 goal 工具。
 - **OpenCode v2 SDK/API**：adapter 创建 session 后使用 `session.goal.set` 设置 objective/可选 token budget，订阅 `session.next.goal.updated`，并以该 session 的原生 loop/continuation 运行。`session.goal.get|update|clear` 提供状态、暂停/恢复、结束与清理；adapter 应把 `active`、`complete`、`blocked`、`budget_limited`、`usage_limited` 等原生状态作为 provider 事实转发。普通 `session.prompt`、session history 或 plan agent 本身不等价于 goal mode，只有目标 Gateway 实际安装并声明支持上述 v2 goal contract 时才可声明 `core.native_goal` capability。
 

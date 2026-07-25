@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -107,9 +108,17 @@ impl Store {
             .context("parse SQLite connection string")?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // API handlers and the scheduler are independent Tokio tasks and
+            // may legitimately contend for SQLite's single writer.  Waiting
+            // briefly is preferable to surfacing a transient 500 to clients.
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            // SQLite has one writer and this daemon is intentionally the sole
+            // authoritative state owner. A single pooled connection makes
+            // that invariant explicit and prevents concurrent handlers or
+            // scheduler tasks from racing at the SQLite file lock.
+            .max_connections(1)
             .connect_with(options)
             .await
             .context("open SQLite database")?;

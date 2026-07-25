@@ -111,6 +111,39 @@ pub async fn prepare(config: &Config) -> Result<()> {
         false,
     )
     .await?;
+    verify_configured_agents(config).await?;
+    Ok(())
+}
+
+async fn verify_configured_agents(config: &Config) -> Result<()> {
+    let mut adapters = std::collections::BTreeSet::new();
+    for route in &config.routes {
+        adapters.insert(route.adapter.as_str());
+    }
+    for adapter in adapters {
+        let binary = config
+            .agent_binary(adapter)
+            .with_context(|| format!("missing Agent binary for {adapter}"))?;
+        thieving_eyes_runtime_sandbox_agent::verify_sha256(&binary.binary, &binary.sha256)
+            .await
+            .with_context(|| format!("verify {adapter} Agent binary"))?;
+        match (
+            binary.agent_process_binary.as_deref(),
+            binary.agent_process_sha256.as_deref(),
+        ) {
+            (Some(path), Some(digest)) => {
+                thieving_eyes_runtime_sandbox_agent::verify_sha256(path, digest)
+                    .await
+                    .with_context(|| format!("verify {adapter} Agent process"))?;
+            }
+            (None, None) => {}
+            _ => {
+                anyhow::bail!(
+                    "{adapter} Agent process path and digest must be configured together"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

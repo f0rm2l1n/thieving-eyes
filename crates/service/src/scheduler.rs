@@ -94,7 +94,7 @@ pub async fn run(context: SchedulerContext, mut shutdown: watch::Receiver<bool>)
                         submission_id: submission.submission_id.clone(),
                         attempt_id: attempt_id.clone(),
                         route_id: dispatch.route_id.clone(),
-                        adapter: "opencode".to_owned(),
+                        adapter: dispatch.adapter.clone(),
                         model: dispatch
                             .model
                             .clone()
@@ -221,6 +221,7 @@ enum DispatchDecision {
 #[derive(Debug)]
 struct Dispatch {
     route_id: String,
+    adapter: String,
     source_id: String,
     source_label: String,
     model: Option<String>,
@@ -257,6 +258,7 @@ async fn select_dispatch(
                 Some(available) if available > 0 => {
                     return Ok(DispatchDecision::Ready(Dispatch {
                         route_id: route.id.clone(),
+                        adapter: route.adapter.clone(),
                         source_id: source.id.clone(),
                         source_label: source.label.clone(),
                         model,
@@ -329,12 +331,19 @@ async fn run_attempt(
         .local_source_binding(&dispatch.source_id)
         .map(|binding| binding.inherit_proxy_environment.clone())
         .unwrap_or_default();
+    let agent_binary = context
+        .config
+        .agent_binary(&dispatch.adapter)
+        .ok_or_else(|| anyhow::anyhow!("missing frozen Agent binary for {}", dispatch.adapter))?;
     let runner_request = RunnerRequest {
         attempt_id: attempt_id.clone(),
         sandbox_agent_path: context.config.sandbox_agent_path(),
         sandbox_agent_sha256: SANDBOX_AGENT_SHA256.to_owned(),
-        opencode_path: context.config.local_runner.opencode_binary.clone(),
-        opencode_sha256: context.config.local_runner.opencode_sha256.clone(),
+        adapter: dispatch.adapter,
+        agent_path: agent_binary.binary,
+        agent_sha256: agent_binary.sha256,
+        agent_process_path: agent_binary.agent_process_binary,
+        agent_process_sha256: agent_binary.agent_process_sha256,
         bubblewrap_path: context.config.local_runner.bubblewrap_binary.clone(),
         workspace_path,
         workspace_writable: writable,

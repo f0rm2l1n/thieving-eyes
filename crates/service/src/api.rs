@@ -292,31 +292,34 @@ async fn result(
 }
 
 async fn capabilities(State(state): State<ServiceState>) -> Json<CapabilityCatalog> {
-    let models = state
-        .config
-        .routes
-        .iter()
-        .filter(|route| route.adapter == "opencode" && !route.model.is_empty())
-        .map(|route| route.model.clone())
-        .collect::<BTreeSet<_>>();
-    Json(CapabilityCatalog {
-        capabilities: vec![
-            capability("core.task", BTreeMap::new()),
-            capability(
-                "core.workspace.local",
-                BTreeMap::from([("access".to_owned(), json!(["read_only", "writable"]))]),
-            ),
-            capability("core.events.sse", BTreeMap::new()),
-            capability(
-                "agent.opencode",
-                BTreeMap::from([
-                    ("mode".to_owned(), json!(["task"])),
-                    ("models".to_owned(), json!(models)),
-                ]),
-            ),
-            capability("sandbox.bubblewrap", BTreeMap::new()),
-        ],
-    })
+    let mut adapters = BTreeMap::<String, BTreeSet<String>>::new();
+    for route in &state.config.routes {
+        if !route.model.is_empty() {
+            adapters
+                .entry(route.adapter.clone())
+                .or_default()
+                .insert(route.model.clone());
+        } else {
+            adapters.entry(route.adapter.clone()).or_default();
+        }
+    }
+    let mut capabilities = vec![
+        capability("core.task", BTreeMap::new()),
+        capability(
+            "core.workspace.local",
+            BTreeMap::from([("access".to_owned(), json!(["read_only", "writable"]))]),
+        ),
+        capability("core.events.sse", BTreeMap::new()),
+        capability("sandbox.bubblewrap", BTreeMap::new()),
+    ];
+    capabilities.extend(adapters.into_iter().map(|(adapter, models)| {
+        let mut constraints = BTreeMap::from([("mode".to_owned(), json!(["task"]))]);
+        if !models.is_empty() {
+            constraints.insert("models".to_owned(), json!(models));
+        }
+        capability(&format!("agent.{adapter}"), constraints)
+    }));
+    Json(CapabilityCatalog { capabilities })
 }
 
 async fn profiles(State(state): State<ServiceState>) -> Json<Page<ResourceSummary>> {
@@ -463,12 +466,7 @@ async fn validate_request(
         ));
     }
     if request.agent.as_ref().is_some_and(|agent| {
-        agent
-            .adapter
-            .as_deref()
-            .is_some_and(|adapter| adapter != "opencode")
-            || !agent.extensions.is_empty()
-            || !agent.required_capabilities.is_empty()
+        !agent.extensions.is_empty() || !agent.required_capabilities.is_empty()
     }) {
         return Err(ApiFailure::capability(
             "requested Agent capability is unavailable",
@@ -561,17 +559,29 @@ async fn validate_request(
         .agent
         .as_ref()
         .and_then(|agent| agent.model.as_deref());
+    let requested_adapter = request
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.adapter.as_deref());
     let route_ids = request
         .execution
         .as_ref()
         .and_then(|execution| execution.route_ids.as_ref())
         .cloned()
-        .unwrap_or_else(|| vec![config.defaults.route_id.clone()]);
+        .unwrap_or_else(|| {
+            if requested_adapter.is_some() || requested_model.is_some() {
+                config.routes.iter().map(|route| route.id.clone()).collect()
+            } else {
+                vec![config.defaults.route_id.clone()]
+            }
+        });
     let routes: Vec<RouteConfig> = route_ids
         .iter()
         .filter_map(|id| config.route(id))
         .filter(|route| {
-            requested_model.is_none_or(|model| route.model.is_empty() || route.model == model)
+            requested_adapter.is_none_or(|adapter| route.adapter == adapter)
+                && requested_model
+                    .is_none_or(|model| route.model.is_empty() || route.model == model)
         })
         .cloned()
         .collect();
@@ -579,7 +589,7 @@ async fn validate_request(
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "route_unsatisfied",
-            "no requested route can satisfy the Agent model",
+            "no requested route can satisfy the Agent adapter and model",
             ErrorScope::Route,
         ));
     }

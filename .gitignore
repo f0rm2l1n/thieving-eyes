@@ -1,5 +1,8 @@
 /target/
 /.cache/
+/sdk/typescript/.test-dist/
+/sdk/typescript/dist/
+/sdk/typescript/node_modules/
 /config.toml
 /config.toml.backup-*
 /opencode/

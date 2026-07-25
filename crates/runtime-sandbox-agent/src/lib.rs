@@ -10,7 +10,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep, timeout};
@@ -29,6 +29,7 @@ struct ActiveSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeRunRequest {
     pub sandbox_agent_path: PathBuf,
+    pub adapter: String,
     pub cwd: PathBuf,
     pub prompt: String,
     pub model: Option<String>,
@@ -165,10 +166,22 @@ pub async fn ensure_binary(
 ///
 /// Returns an error when the file cannot be read or its digest differs.
 pub async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let bytes = tokio::fs::read(path)
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("read {} for digest verification", path.display()))?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+        .with_context(|| format!("open {} for digest verification", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read {} for digest verification", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", digest.finalize());
     if actual != expected {
         bail!(
             "digest mismatch for {}: expected {expected}, got {actual}",
@@ -289,7 +302,7 @@ async fn prepare_session(
     .json()
     .await
     .context("decode Sandbox Agent agent discovery")?;
-    let agent_version = discover_opencode_version(&agents)?;
+    let agent_version = discover_agent_version(&agents, &request.adapter)?;
     events
         .send(RuntimeEvent::Started {
             agent_version: agent_version.clone(),
@@ -301,7 +314,7 @@ async fn prepare_session(
     let acp_url = format!("{base_url}/v1/acp/{server_id}");
     control_rpc(
         client,
-        &format!("{acp_url}?agent=opencode"),
+        &format!("{acp_url}?agent={}", request.adapter),
         token,
         json!({
             "jsonrpc": "2.0",
@@ -344,7 +357,7 @@ async fn prepare_session(
             }),
         )
         .await
-        .context("set requested OpenCode model")?;
+        .with_context(|| format!("set requested {} model", request.adapter))?;
     }
 
     Ok(ActiveSession {
@@ -940,26 +953,31 @@ async fn respond_permission(
     Ok(())
 }
 
-fn discover_opencode_version(agents: &Value) -> Result<Option<String>> {
-    let text = agents.to_string();
-    if !text.contains("opencode") {
-        bail!("Sandbox Agent did not discover OpenCode");
+fn discover_agent_version(agents: &Value, adapter: &str) -> Result<Option<String>> {
+    let agent = find_agent(agents, adapter)
+        .with_context(|| format!("Sandbox Agent did not discover {adapter}"))?;
+    if agent
+        .get("installed")
+        .and_then(Value::as_bool)
+        .is_some_and(|installed| !installed)
+    {
+        bail!("Sandbox Agent reports {adapter} is not installed");
     }
-    Ok(find_opencode_version(agents))
+    Ok(agent
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
-fn find_opencode_version(value: &Value) -> Option<String> {
+fn find_agent<'a>(value: &'a Value, adapter: &str) -> Option<&'a serde_json::Map<String, Value>> {
     match value {
         Value::Object(map) => {
-            if map.values().any(|item| item.as_str() == Some("opencode")) {
-                return map
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+            if map.get("id").and_then(Value::as_str) == Some(adapter) {
+                return Some(map);
             }
-            map.values().find_map(find_opencode_version)
+            map.values().find_map(|value| find_agent(value, adapter))
         }
-        Value::Array(values) => values.iter().find_map(find_opencode_version),
+        Value::Array(values) => values.iter().find_map(|value| find_agent(value, adapter)),
         _ => None,
     }
 }
@@ -1025,7 +1043,7 @@ fn classify_error(error: &anyhow::Error) -> &'static str {
         "timeout"
     } else if message.contains("authentication") || message.contains("login") {
         "source_auth_required"
-    } else if message.contains("discover OpenCode") {
+    } else if message.contains("did not discover") || message.contains("is not installed") {
         "capability_unavailable"
     } else {
         "runtime_unavailable"
@@ -1105,5 +1123,22 @@ mod tests {
         truncate_to_bytes(&mut second, 7_usize.saturating_sub(output.len()));
         output.push_str(&second);
         assert_eq!(output, "你好x");
+    }
+
+    #[test]
+    fn agent_discovery_is_adapter_specific() {
+        let agents = json!({
+            "agents": [
+                {"id": "codex", "installed": true, "version": "codex-cli 1.2.3"},
+                {"id": "opencode", "installed": false, "version": "2.0.0"}
+            ]
+        });
+        assert_eq!(
+            discover_agent_version(&agents, "codex")
+                .unwrap_or_else(|error| panic!("Codex should be discovered: {error}")),
+            Some("codex-cli 1.2.3".to_owned())
+        );
+        assert!(discover_agent_version(&agents, "opencode").is_err());
+        assert!(discover_agent_version(&agents, "missing").is_err());
     }
 }

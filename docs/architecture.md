@@ -93,7 +93,15 @@ sdks/                        生成 client 与薄 helper
 
 目录可以在编码前微调名称，但控制面、runner、runtime wrapper 和上游 patch 不得重新耦合到一个 crate。
 
-## 4. 修改版 OpenCode
+## 4. Codex binding
+
+普通 Codex task 仍通过 Sandbox Agent 的 HTTP/ACP 边界执行。固定的 `codex-acp` Agent process 在 sandbox 内启动所选固定 digest 的 `codex app-server`，把 ACP session/prompt/cancel 与事件映射到 app-server thread/turn/item。runner 通过 `CODEX_PATH` 指向本 Attempt 挂载的 Codex binary，不使用 adapter 自带的浮动 binary。
+
+Codex SDK 不是第三种 runtime。Python SDK 是 app-server 的高层 client；TypeScript SDK 是 `codex exec` JSONL 的高层 client。thieving-eyes 不嵌入任一语言 SDK，也不为 `codex exec` 维护平行状态机。需要的 task、stream、permission、usage 与取消语义统一从 app-server 经 `codex-acp` 进入既有 Sandbox Agent binding。
+
+Codex binary、`codex-acp` package/entrypoint 与 Node runtime 都属于 target 安装物，必须在派发前存在并核对 digest/version；Attempt 阶段禁止 npm/npx 下载。`core.session_resume`、`core.native_goal` 或结构化输出只有各自的 app-server/ACP 映射通过 conformance 后才能发布，不能因为 app-server 自身拥有某个方法就自动对外宣称支持。
+
+## 5. 修改版 OpenCode
 
 普通 OpenCode task 使用 Sandbox Agent 的安装、server、session、SSE、取消和清理路径。
 
@@ -108,7 +116,7 @@ sdks/                        生成 client 与薄 helper
 
 通用修改优先贡献上游；只对本机 OpenCode 有意义的能力保留在窄 patch 中。不得维护一份与上游全面分叉的 Sandbox Agent。
 
-## 5. Runtime 与 credential 隔离
+## 6. Runtime 与 credential 隔离
 
 `ExecutionDomain` 至少由以下内容确定：
 
@@ -129,7 +137,7 @@ source secret 默认保存在执行 target 的受限 secret resolver 中。daemo
 
 daemon SQLite、配置和 UDS 默认只对服务用户可读写。v1 不自造应用层数据库加密；prompt 采用短 retention，长期 secret 不入库，磁盘静态加密由操作系统/部署环境提供。
 
-## 6. 持久化与恢复
+## 7. 持久化与恢复
 
 SQLite 是 Submission、Attempt、Session metadata、lease、取消意图和规范化事件的权威存储。Sandbox Agent 的内存 session/event buffer 不是事实来源。
 
@@ -147,7 +155,7 @@ lease timeout 使用单调时钟判断运行期超时；持久化 deadline 使�
 
 runner 失联或 dispatch lease stale 不等于远端 provider 已停止。只有取得进程终止、provider session 结束或有效 fencing 的证据后才能释放对应 source 占用并安全重试；否则 Attempt/Submission 进入 `uncertain`，source 容量保持保留或进入保守 quarantine，直到 capacity monitor 证明占用消失或管理员处理。控制面 lease 过期不能凭空制造算力。
 
-## 7. 调度与容量
+## 8. 调度与容量
 
 daemon 使用单 scheduler authority。若 monitor 能观测 provider 的总在用并发（包含 thieving-eyes 自己的任务），source 的保守可用量按下式理解：
 
@@ -161,7 +169,7 @@ configured_limit
 
 排序至少考虑 client fair share、priority、aging、not_before 和 start_deadline。高 priority 不能绕过权限、预算、session affinity、target compatibility 或 source 安全余量。
 
-## 8. 非交互执行
+## 9. 非交互执行
 
 Submission 是后台非交互任务。默认执行语义是：Agent 在已建立的 sandbox 内以自动批准模式运行，permission 不逐项等待人工确认；sandbox、workspace、network、secret、extension 与 side-effect policy 仍是不可绕过的系统边界。
 
@@ -171,7 +179,7 @@ YOLO/auto-approve 是 Agent 层的审批策略，不是 sandbox。runner 必须�
 
 这些行为由管理员发布的不可变 Profile 固化。Submission 可以选择获准的 Profile 或施加更严格约束，但不能直接传递 provider-specific `yolo`、`bypass`、approval flag，不能关闭 sandbox。宿主机无隔离自动批准若未来支持，必须使用独立、显式标记为高风险的管理员 Profile，不属于默认模式。
 
-## 9. Workspace 与 sandbox
+## 10. Workspace 与 sandbox
 
 Sandbox Agent 是 sandbox 内的 Agent controller，不是 sandbox provider。thieving-eyes v1 不实现通用 VM/container/Kubernetes 编排层；target 管理员负责准备可运行 runner 和 Sandbox Agent 的隔离环境。
 
@@ -185,7 +193,7 @@ v1 的本机 first-party backend 是 Linux `bubblewrap`。它负责 user/mount/p
 
 scheduler 对 canonical local workspace identity 持有持久 `writable` 独占锁；锁与 Attempt/lease generation 一起恢复，不能因 runner 失联自动释放。`read_only` 和 overlay 是否可并行由 sandbox capability 决定，不能只相信调用方声明。
 
-## 10. SDK 与集成
+## 11. SDK 与集成
 
 TypeScript、Python 和 Go SDK 共享 OpenAPI 生成的模型与基础 client。手写部分只提供：
 
@@ -196,7 +204,7 @@ TypeScript、Python 和 Go SDK 共享 OpenAPI 生成的模型与基础 client。
 
 SDK 不实现 route 选择、重试、capacity、credential 或状态归约。Tunascope、BrainAFK 与其他项目无论使用何种语言，都调用同一 daemon API。
 
-## 11. 验证与发布门槛
+## 12. 验证与发布门槛
 
 在发布 v1 前必须具备：
 
@@ -211,7 +219,7 @@ SDK 不实现 route 选择、重试、capacity、credential 或状态归约。Tu
 
 runtime capability 必须由启动时探测与测试决定，不能由 agent 名称或配置声明单方面伪造。升级 Sandbox Agent、Codex、OpenCode 或 patch revision 时必须重新跑 conformance suite。
 
-## 12. v1 明确不做
+## 13. v1 明确不做
 
 - 多控制面高可用或跨区域共识；
 - 通用 sandbox provider 编排；

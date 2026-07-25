@@ -1,6 +1,6 @@
 # 内网构建与部署
 
-本文说明如何把当前 `0.1` 本机执行栈迁入可通过代理访问公网的企业内网。当前可发布拓扑是 daemon、runner、Sandbox Agent、OpenCode 与 workspace 位于同一台 Linux 主机；跨机器 HTTPS API、远程 runner、WorkspaceBinding、goal 和持久 session 尚未实现，不能仅靠配置启用。
+本文说明如何把当前 `0.1` 本机执行栈迁入可通过代理访问公网的企业内网。当前可发布拓扑是 daemon、runner、Sandbox Agent、Codex/OpenCode 与 workspace 位于同一台 Linux 主机；跨机器 HTTPS API、远程 runner、WorkspaceBinding、goal 和持久 session 尚未实现，不能仅靠配置启用。
 
 ## 1. 迁移基线
 
@@ -10,6 +10,8 @@
 - Rust stable `1.94` 或与 workspace `rust-version` 相容的更高稳定版本；
 - Linux x86_64 运行环境、glibc/libgcc 兼容性和 bubblewrap 版本；
 - Sandbox Agent `0.4.2`，SHA-256 `bab098abef874ade481aa7b50463662814fbf27294399f545307fedb638f029b`；
+- Codex route 使用的 `@agentclientprotocol/codex-acp@1.1.7` npm tarball、entrypoint digest、Node 22 和 Codex binary digest；
+- Codex ChatGPT subscription 的 Route/model catalog 与目标机 `codex debug models` 校验结果；
 - 本地 OpenCode binary、provider 配置、patch set 与 SHA-256；
 - `Cargo.lock`、最终 `config.toml` 和所有发布二进制的 SHA-256 manifest。
 
@@ -20,9 +22,9 @@
 构建机至少需要 Rust/Cargo、C toolchain、Git、CA certificate、pkg-config 和常见构建工具。运行机需要：
 
 - `/usr/bin/bwrap`，以及允许 user、mount、PID、IPC、UTS 和 network namespace 的内核/服务策略；
-- 可执行的 OpenCode binary；
+- 所选 route 的 Codex/OpenCode binary；Codex 还需要 Node 22 与预安装的固定 `codex-acp` entrypoint；
 - 系统 DNS 和 CA trust 能访问 provider endpoint；
-- 服务用户可读的 OpenCode 配置/认证文件；
+- 服务用户可读的 Agent 配置/认证文件；
 - 服务用户可读写的 SQLite state、runtime cache 和 workspace；
 - 足够的临时目录和 workspace 磁盘。
 
@@ -50,7 +52,7 @@ curl -fsSI \
   >/dev/null
 ```
 
-OpenCode 的运行时网络与构建网络是两个边界。runner 会清空宿主环境，只显式建立 sandbox HOME、XDG、PATH，以及当前 SourceBinding 明确列出的代理变量。provider 若要求代理，在 `[[local_runner.source_bindings]]` 中配置 `inherit_proxy_environment`；允许值仅为大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。实际值必须由目标机服务环境提供，不写入 Submission 或 daemon 配置，也不能用于注入 provider key 等任意变量。
+Agent 的运行时网络与构建网络是两个边界。runner 会清空宿主环境，只显式建立 sandbox HOME、XDG、PATH，以及当前 SourceBinding 明确列出的代理变量。provider 若要求代理，在 `[[local_runner.source_bindings]]` 中配置 `inherit_proxy_environment`；允许值仅为大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。实际值必须由目标机服务环境提供，不写入 Submission 或 daemon 配置，也不能用于注入 provider key 等任意变量。
 
 ## 4. Rustup 镜像
 
@@ -134,6 +136,8 @@ sha256sum \
   target/release/thieving-eyesd \
   target/release/thieving-eyes-runner \
   target/release/eyes \
+  /absolute/path/to/codex \
+  /absolute/path/to/codex-acp \
   /absolute/path/to/opencode \
   > SHA256SUMS
 ```
@@ -177,7 +181,22 @@ eyes init \
 eyes doctor
 ```
 
-先把三个 release binary 安装到最终目录，再使用最终服务用户和最终 XDG/HOME 环境执行 `eyes init`。生成器会把当前 `eyes` 的同目录 `thieving-eyes-runner`、当前 OpenCode、credential 文件和绝对 workspace 路径写进配置；在 build tree 中生成后直接复制配置通常会留下错误路径。
+先把三个 release binary 安装到最终目录，再使用最终服务用户和最终 XDG/HOME 环境执行 `eyes init`。生成器会把当前 `eyes` 的同目录 `thieving-eyes-runner`、所选 Agent、credential 文件和绝对 workspace 路径写进配置；在 build tree 中生成后直接复制配置通常会留下错误路径。daemon 启动时还会核对每个 route 所需 Agent binary 与 Codex `codex-acp` entrypoint 的 digest，迁移后必须重新运行 `eyes doctor` 并解决所有 digest/path 报错。
+
+Codex route 必须在联网构建/安装机预取 adapter，再随 release artifact 一起传入内网；运行时禁止 npx：
+
+```bash
+npm install --prefix /opt/thieving-eyes/codex-acp/1.1.7 \
+  @agentclientprotocol/codex-acp@1.1.7
+
+eyes init \
+  --adapter codex \
+  --codex /opt/thieving-eyes/bin/codex \
+  --codex-acp /opt/thieving-eyes/codex-acp/1.1.7/node_modules/@agentclientprotocol/codex-acp/dist/index.js \
+  --workspace-root /absolute/path/to/projects
+```
+
+审计并保存 npm tarball SHA-256 `642920240baa0b6b1951fb2c56b9ff11689648019499615f941000d95d127301`，同时保存实际 entrypoint、Node 与 Codex binary digest。企业镜像可以提供同一 tarball，但不能在任务启动时查询 ACP registry latest。
 
 若下载不稳定，先从受控内部 artifact store 取得固定 binary。使用默认 XDG 路径时，可以在运行 `eyes init` 前预置：
 
@@ -220,7 +239,7 @@ download_if_missing = false
 /run/thieving-eyes/daemon.sock
 ```
 
-OpenCode credential/config 由 `[[local_runner.credential_files]]` 引用，以 `0600` 保存并只读挂载进每个 Attempt。不要把 token 写入 Source、Route、capacity probe 参数或 systemd `ExecStart`。
+Codex/OpenCode credential/config 由 `[[local_runner.credential_files]]` 引用，以 `0600` 保存并只读挂载进每个 Attempt。不要把 token 写入 Source、Route、capacity probe 参数或 systemd `ExecStart`。
 
 建议为 thieving-eyes 单独维护 OpenCode 配置目录，例如
 `/var/lib/thieving-eyes/secrets/opencode/<source>/opencode.jsonc`，不要引用服务用户日常使用的

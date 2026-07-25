@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -17,12 +17,12 @@ use thieving_eyes_protocol::{
     SubmissionResult, SubmissionState, SubmissionStatus, TaskMode, WorkspaceAccess, WorkspaceRef,
 };
 use thieving_eyes_service::config::{
-    CapacityMonitorConfig, Config, CredentialFile, DaemonConfig, Defaults, LocalRunnerConfig,
-    NetworkMode, PolicyConfig, ProfileConfig, RouteConfig, RuntimeConfig, SourceConfig,
-    WorkspaceRootConfig, default_config_path, default_data_dir, default_runtime_dir,
+    AgentBinaryConfig, CapacityMonitorConfig, Config, CredentialFile, DaemonConfig, Defaults,
+    LocalRunnerConfig, NetworkMode, PolicyConfig, ProfileConfig, RouteConfig, RuntimeConfig,
+    SourceConfig, WorkspaceRootConfig, default_config_path, default_data_dir, default_runtime_dir,
     default_state_dir,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use ulid::Ulid;
 
@@ -37,33 +37,34 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init {
-        #[arg(long)]
-        workspace_root: PathBuf,
-        #[arg(long, default_value = "local")]
-        root_id: String,
-        #[arg(long)]
-        opencode: Option<PathBuf>,
-        #[arg(long, default_value = "")]
-        model: String,
-        #[arg(long)]
-        force: bool,
-    },
+    Init(InitArgs),
     Doctor,
     Submit(TaskArgs),
     Run(TaskArgs),
-    Status {
-        submission_id: String,
-    },
-    Watch {
-        submission_id: String,
-    },
-    Result {
-        submission_id: String,
-    },
-    Cancel {
-        submission_id: String,
-    },
+    Status { submission_id: String },
+    Watch { submission_id: String },
+    Result { submission_id: String },
+    Cancel { submission_id: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct InitArgs {
+    #[arg(long)]
+    workspace_root: PathBuf,
+    #[arg(long, default_value = "local")]
+    root_id: String,
+    #[arg(long)]
+    opencode: Option<PathBuf>,
+    #[arg(long)]
+    codex: Option<PathBuf>,
+    #[arg(long)]
+    codex_acp: Option<PathBuf>,
+    #[arg(long, default_value = "opencode")]
+    adapter: String,
+    #[arg(long, default_value = "")]
+    model: String,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -77,6 +78,8 @@ struct TaskArgs {
     priority: u8,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    adapter: Option<String>,
 }
 
 #[tokio::main]
@@ -84,23 +87,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.map_or_else(default_config_path, Ok)?;
     match args.command {
-        Command::Init {
-            workspace_root,
-            root_id,
-            opencode,
-            model,
-            force,
-        } => {
-            init(
-                &config_path,
-                workspace_root,
-                root_id,
-                opencode,
-                model,
-                force,
-            )
-            .await
-        }
+        Command::Init(options) => init(&config_path, options).await,
         Command::Doctor => doctor(&config_path).await,
         Command::Submit(task) => {
             let config = Config::load(&config_path).await?;
@@ -159,14 +146,17 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn init(
-    config_path: &Path,
-    workspace_root: PathBuf,
-    root_id: String,
-    opencode: Option<PathBuf>,
-    model: String,
-    force: bool,
-) -> Result<()> {
+async fn init(config_path: &Path, options: InitArgs) -> Result<()> {
+    let InitArgs {
+        workspace_root,
+        root_id,
+        opencode,
+        codex,
+        codex_acp,
+        adapter,
+        model,
+        force,
+    } = options;
     if tokio::fs::try_exists(config_path).await? && !force {
         bail!(
             "configuration already exists at {}; pass --force to replace it",
@@ -177,13 +167,42 @@ async fn init(
     let workspace_root = tokio::fs::canonicalize(&workspace_root)
         .await
         .with_context(|| format!("resolve workspace root {}", workspace_root.display()))?;
-    let opencode = match opencode {
-        Some(path) => tokio::fs::canonicalize(path).await?,
-        None => {
-            find_in_path("opencode").context("OpenCode was not found in PATH; pass --opencode")?
+    let (agent, agent_process) = match adapter.as_str() {
+        "opencode" => {
+            if codex.is_some() || codex_acp.is_some() {
+                bail!("--codex and --codex-acp require --adapter codex");
+            }
+            let binary = match opencode {
+                Some(path) => tokio::fs::canonicalize(path).await?,
+                None => find_in_path("opencode")
+                    .context("OpenCode was not found in PATH; pass --opencode")?,
+            };
+            (binary, None)
         }
+        "codex" => {
+            if opencode.is_some() {
+                bail!("--opencode cannot be combined with --adapter codex");
+            }
+            let binary = match codex {
+                Some(path) => tokio::fs::canonicalize(path).await?,
+                None => {
+                    find_in_path("codex").context("Codex was not found in PATH; pass --codex")?
+                }
+            };
+            let process = match codex_acp {
+                Some(path) => tokio::fs::canonicalize(path).await?,
+                None => find_in_path("codex-acp")
+                    .context("codex-acp was not found in PATH; pass --codex-acp")?,
+            };
+            (binary, Some(process))
+        }
+        _ => bail!("--adapter must be codex or opencode"),
     };
-    let opencode_sha256 = digest_file(&opencode).await?;
+    let agent_sha256 = digest_file(&agent).await?;
+    let agent_process_sha256 = match agent_process.as_deref() {
+        Some(path) => Some(digest_file(path).await?),
+        None => None,
+    };
     let current = std::env::current_exe()?;
     let runner_binary = current
         .parent()
@@ -195,32 +214,48 @@ async fn init(
     let home = home_dir()?;
     tokio::fs::create_dir_all(config_dir).await?;
     set_private_dir(config_dir).await?;
-    let source_config_dir = config_dir.join("opencode/default");
+    let source_config_dir = config_dir.join(&adapter).join("default");
     tokio::fs::create_dir_all(&source_config_dir).await?;
     if let Some(source_config_root) = source_config_dir.parent() {
         set_private_dir(source_config_root).await?;
     }
     set_private_dir(&source_config_dir).await?;
     let mut credential_files = Vec::new();
-    for (discovered, independent, sandbox) in [
-        (
-            home.join(".local/share/opencode/auth.json"),
-            source_config_dir.join("auth.json"),
-            PathBuf::from(".local/share/opencode/auth.json"),
-        ),
-        (
-            home.join(".config/opencode/opencode.jsonc"),
-            source_config_dir.join("opencode.jsonc"),
-            PathBuf::from(".config/opencode/opencode.jsonc"),
-        ),
-    ] {
+    let imports = match adapter.as_str() {
+        "opencode" => vec![
+            (
+                home.join(".local/share/opencode/auth.json"),
+                source_config_dir.join("auth.json"),
+                PathBuf::from(".local/share/opencode/auth.json"),
+            ),
+            (
+                home.join(".config/opencode/opencode.jsonc"),
+                source_config_dir.join("opencode.jsonc"),
+                PathBuf::from(".config/opencode/opencode.jsonc"),
+            ),
+        ],
+        "codex" => vec![
+            (
+                home.join(".codex/auth.json"),
+                source_config_dir.join("auth.json"),
+                PathBuf::from(".codex/auth.json"),
+            ),
+            (
+                home.join(".codex/config.toml"),
+                source_config_dir.join("config.toml"),
+                PathBuf::from(".codex/config.toml"),
+            ),
+        ],
+        _ => Vec::new(),
+    };
+    for (discovered, independent, sandbox) in imports {
         if !tokio::fs::try_exists(&independent).await? && tokio::fs::try_exists(&discovered).await?
         {
             tokio::fs::copy(&discovered, &independent)
                 .await
                 .with_context(|| {
                     format!(
-                        "import OpenCode file {} into {}",
+                        "import {adapter} file {} into {}",
                         discovered.display(),
                         independent.display()
                     )
@@ -236,6 +271,14 @@ async fn init(
             });
         }
     }
+    let agent_binary = AgentBinaryConfig {
+        adapter: adapter.clone(),
+        binary: agent.clone(),
+        sha256: agent_sha256.clone(),
+        agent_process_binary: agent_process,
+        agent_process_sha256,
+    };
+    let route_id = format!("{adapter}_default");
     let config = Config {
         daemon: DaemonConfig {
             socket_path: runtime_dir.join("daemon.sock"),
@@ -249,20 +292,21 @@ async fn init(
         local_runner: LocalRunnerConfig {
             runner_binary,
             bubblewrap_binary: PathBuf::from("/usr/bin/bwrap"),
-            opencode_binary: opencode,
-            opencode_sha256,
+            opencode_binary: None,
+            opencode_sha256: None,
+            agent_binaries: vec![agent_binary],
             credential_files,
             source_bindings: Vec::new(),
         },
         defaults: Defaults {
             profile_id: "local_coding".to_owned(),
             policy_id: "standard".to_owned(),
-            route_id: "opencode_default".to_owned(),
+            route_id: route_id.clone(),
         },
         profiles: vec![ProfileConfig {
             id: "local_coding".to_owned(),
             version: "1".to_owned(),
-            description: "Non-interactive OpenCode in required bubblewrap sandbox".to_owned(),
+            description: format!("Non-interactive {adapter} in required bubblewrap sandbox"),
             network: NetworkMode::Inherited,
         }],
         policies: vec![PolicyConfig {
@@ -280,8 +324,8 @@ async fn init(
             monitor: CapacityMonitorConfig::Static,
         }],
         routes: vec![RouteConfig {
-            id: "opencode_default".to_owned(),
-            adapter: "opencode".to_owned(),
+            id: route_id,
+            adapter,
             model,
             source_ids: vec!["default".to_owned()],
             target_id: "local".to_owned(),
@@ -319,11 +363,6 @@ async fn doctor(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path).await?;
     check_private(config_path).await?;
     thieving_eyes_service::prepare(&config).await?;
-    if digest_file(&config.local_runner.opencode_binary).await?
-        != config.local_runner.opencode_sha256
-    {
-        bail!("OpenCode digest differs from the initialized configuration");
-    }
     for mapping in &config.local_runner.credential_files {
         if !tokio::fs::try_exists(&mapping.host_path).await? {
             bail!(
@@ -332,13 +371,54 @@ async fn doctor(config_path: &Path) -> Result<()> {
             );
         }
     }
-    let opencode = tokio::process::Command::new(&config.local_runner.opencode_binary)
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .output()
-        .await?;
-    if !opencode.status.success() {
-        bail!("OpenCode version check failed");
+    let adapters = config
+        .routes
+        .iter()
+        .map(|route| route.adapter.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut agent_versions = Vec::new();
+    let mut agent_process_versions = Vec::new();
+    for adapter in adapters {
+        let binary = config
+            .agent_binary(adapter)
+            .with_context(|| format!("missing Agent binary for {adapter}"))?;
+        if digest_file(&binary.binary).await? != binary.sha256 {
+            bail!("{adapter} digest differs from the initialized configuration");
+        }
+        if let (Some(process), Some(expected)) = (
+            binary.agent_process_binary.as_deref(),
+            binary.agent_process_sha256.as_deref(),
+        ) {
+            if digest_file(process).await? != expected {
+                bail!("{adapter} Agent process digest differs from the configuration");
+            }
+            let version = tokio::process::Command::new(process)
+                .arg("--version")
+                .stdout(Stdio::piped())
+                .output()
+                .await
+                .with_context(|| format!("run {adapter} Agent process version check"))?;
+            if !version.status.success() {
+                bail!("{adapter} Agent process version check failed");
+            }
+            agent_process_versions.push((
+                adapter.to_owned(),
+                String::from_utf8_lossy(&version.stdout).trim().to_owned(),
+            ));
+        }
+        let version = tokio::process::Command::new(&binary.binary)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .output()
+            .await
+            .with_context(|| format!("run {adapter} version check"))?;
+        if !version.status.success() {
+            bail!("{adapter} version check failed");
+        }
+        agent_versions.push((
+            adapter.to_owned(),
+            String::from_utf8_lossy(&version.stdout).trim().to_owned(),
+        ));
     }
     let bwrap = tokio::process::Command::new(&config.local_runner.bubblewrap_binary)
         .args([
@@ -378,10 +458,12 @@ async fn doctor(config_path: &Path) -> Result<()> {
     }
     println!("configuration: ok");
     println!("Sandbox Agent 0.4.2: ok");
-    println!(
-        "OpenCode {}: ok",
-        String::from_utf8_lossy(&opencode.stdout).trim()
-    );
+    for (adapter, version) in agent_versions {
+        println!("{adapter} {version}: ok");
+    }
+    for (adapter, version) in agent_process_versions {
+        println!("{adapter} Agent process {version}: ok");
+    }
     println!("bubblewrap: ok");
     Ok(())
 }
@@ -390,18 +472,27 @@ async fn submit(config: &Config, task: TaskArgs) -> Result<SubmissionAccepted> {
     if task.priority > 100 {
         bail!("priority must be between 0 and 100");
     }
-    let route_ids = task.model.as_deref().map(|model| {
+    let route_ids = (task.model.is_some() || task.adapter.is_some()).then(|| {
         config
             .routes
             .iter()
-            .filter(|route| route.model.is_empty() || route.model == model)
+            .filter(|route| {
+                task.adapter
+                    .as_deref()
+                    .is_none_or(|adapter| route.adapter == adapter)
+                    && task
+                        .model
+                        .as_deref()
+                        .is_none_or(|model| route.model.is_empty() || route.model == model)
+            })
             .map(|route| route.id.clone())
             .collect::<Vec<_>>()
     });
     if route_ids.as_ref().is_some_and(Vec::is_empty) {
         bail!(
-            "no configured route supports model {}",
-            task.model.as_deref().unwrap_or_default()
+            "no configured route supports adapter/model {}/{}",
+            task.adapter.as_deref().unwrap_or("*"),
+            task.model.as_deref().unwrap_or("*")
         );
     }
     let workspace = match task.workspace {
@@ -417,15 +508,15 @@ async fn submit(config: &Config, task: TaskArgs) -> Result<SubmissionAccepted> {
         },
         workspace,
         output: None,
-        agent: task
-            .model
-            .map(|model| thieving_eyes_protocol::AgentSelector {
+        agent: (task.adapter.is_some() || task.model.is_some()).then(|| {
+            thieving_eyes_protocol::AgentSelector {
                 profile: None,
-                adapter: Some("opencode".to_owned()),
-                model: Some(model),
+                adapter: task.adapter,
+                model: task.model,
                 required_capabilities: Vec::new(),
                 extensions: Vec::new(),
-            }),
+            }
+        }),
         execution: Some(ExecutionSelector {
             route_ids,
             target_ids: Some(vec!["local".to_owned()]),
@@ -618,14 +709,21 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .context("HOME is required for OpenCode credential discovery")
+        .context("HOME is required for Agent credential discovery")
 }
 
 async fn digest_file(path: &Path) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(tokio::fs::read(path).await?)
-    ))
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(unix)]

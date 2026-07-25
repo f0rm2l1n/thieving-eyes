@@ -16,7 +16,7 @@
 
 项目使用 Rust 实现控制面和 runner；v1 统一使用 Sandbox Agent 作为 Agent runtime。本机修改版 OpenCode 的 goal 能力只会通过局部 adapter patch 接入，并在通过能力探测和 conformance 前保持关闭。
 
-当前 `0.1` 已实现本机 OpenCode task：UDS HTTP API、SQLite 持久队列、priority/aging、静态或命令容量探测、bubblewrap sandbox、事件/结果/取消，以及固定 Sandbox Agent 的下载校验。goal、持久 session、Extension、远程 runner 和 artifact/object transport 仍按 v1 协议保留，但在能力发布前会明确拒绝。
+当前 `0.1` 已实现本机 Codex 与 OpenCode task：UDS HTTP API、SQLite 持久队列、priority/aging、静态或命令容量探测、bubblewrap sandbox、事件/结果/取消，以及固定 Sandbox Agent 的下载校验。Codex 由固定 `codex-acp` 在 sandbox 内驱动 Codex app-server；不嵌入 Python/TypeScript SDK，也不以 `codex exec` 建立第二条执行路径。goal、持久 session、Extension、远程 runner 和 artifact/object transport 仍按 v1 协议保留，但在能力发布前会明确拒绝。
 
 ```text
 cargo build --workspace
@@ -24,16 +24,36 @@ eyes init --workspace-root /absolute/project/root
 eyes doctor
 thieving-eyesd
 eyes run --workspace /absolute/project "完成后台任务"
+eyes run --adapter codex "使用已配置的 Codex route"
+eyes run --adapter codex --model gpt-5.4-mini "使用 Codex ChatGPT subscription 模型"
 eyes run --model provider/model "使用已配置 route 的模型"
 ```
 
 `eyes init` 是显式安装步骤：它从 Sandbox Agent 官方 release 分发地址取得固定版本并校验 SHA-256；daemon 不会在接收任务时临时安装 runtime 或 Agent。
+
+Codex 安装还需要固定的 ACP adapter。管理员先安装并记录其文件 digest，再初始化 Codex 配置：
+
+```text
+npm install --prefix "$HOME/.local/share/thieving-eyes/codex-acp/1.1.7" \
+  @agentclientprotocol/codex-acp@1.1.7
+
+eyes init --adapter codex \
+  --workspace-root /absolute/project/root \
+  --codex /absolute/path/to/codex \
+  --codex-acp "$HOME/.local/share/thieving-eyes/codex-acp/1.1.7/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+```
+
+Node.js/TypeScript 应用可使用 `sdk/typescript` 中的 `@thieving-eyes/sdk`。它通过本机 UDS
+调用同一 Submission API，类型由 `api/openapi.yaml` 生成，并提供持久提交、SSE 续传、取消和
+`run()` 便利方法。应用接入约束与 Tunascope 示例见
+[客户端接入指南](docs/client-integration.md)。
 
 ## 文档
 
 - [执行服务要求](docs/execution-service-requirements.md)
 - [架构与工程基线](docs/architecture.md)
 - [Submission API](docs/submission-api.md)
+- [客户端接入指南](docs/client-integration.md)
 - [Runner Gateway contract](docs/runner-gateway-contract.md)
 - [Sandbox Agent runtime binding](docs/sandbox-agent-runtime.md)
 - [Goal mode](docs/goal-mode.md)

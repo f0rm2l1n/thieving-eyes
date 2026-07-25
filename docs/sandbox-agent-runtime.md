@@ -2,7 +2,7 @@
 
 本文件固定 thieving-eyes v1 与 [Sandbox Agent](https://github.com/rivet-dev/sandbox-agent) 的内部协议边界。Sandbox Agent 是 v1 唯一的通用 Agent runtime；这不是可由 Submission 直接调用的第二套公共 API。
 
-本文设计核对过 Sandbox Agent `0.4.2` 及上游 revision `bbc195cc3fb5a1dd9cb05d8437442768c511e17e`。`0.1` 的 Linux x86_64 安装物来自官方 `https://releases.rivet.dev/sandbox-agent/0.4.2/binaries/sandbox-agent-x86_64-unknown-linux-musl`，固定 SHA-256 为 `bab098abef874ade481aa7b50463662814fbf27294399f545307fedb638f029b`。升级必须同时更新 release、revision、平台 digest 和 conformance 结果，不能跟随 `main`。
+本文设计核对过 Sandbox Agent `0.4.2` 及上游 revision `bbc195cc3fb5a1dd9cb05d8437442768c511e17e`。`0.1` 的 Linux x86_64 安装物来自官方 `https://releases.rivet.dev/sandbox-agent/0.4.2/binaries/sandbox-agent-x86_64-unknown-linux-musl`，固定 SHA-256 为 `bab098abef874ade481aa7b50463662814fbf27294399f545307fedb638f029b`。Codex adapter 固定为 `@agentclientprotocol/codex-acp@1.1.7`；npm tarball SHA-256 是 `642920240baa0b6b1951fb2c56b9ff11689648019499615f941000d95d127301`。升级必须同时更新 release、revision、平台/package digest 和 conformance 结果，不能跟随 `main` 或 ACP registry latest。
 
 ## 1. 部署与所有权
 
@@ -21,13 +21,13 @@ thieving-eyes-runner supervisor
 
 Sandbox Agent 只监听 sandbox network namespace 内的随机 loopback 端口，并使用每次启动生成的高熵 token。只有 worker 持有 endpoint/token；它们不进入 supervisor 持久状态、daemon、DispatchGrant、事件或日志。runtime 不监听宿主或 target 的公网接口。
 
-Agent binary 与 Sandbox Agent 必须在 target image/安装阶段预置并固定版本。个人安装由 `eyes init` 显式下载和校验官方固定二进制，`eyes doctor` 再核对 Sandbox Agent、OpenCode digest/version 与 bubblewrap；daemon 启动和任务执行阶段不得 lazy install、任意上传或使用 credential extraction 兜底，缺失二进制时 target 不发布对应 capability。
+Agent binary、Agent process 与 Sandbox Agent 必须在 target image/安装阶段预置并固定版本。个人安装由 `eyes init` 显式下载和校验官方固定 Sandbox Agent；`eyes doctor` 再核对 Sandbox Agent、所配置的 Codex/OpenCode binary、Codex ACP entrypoint digest/version 与 bubblewrap。daemon 启动和任务执行阶段不得 lazy install、调用 npm/npx、任意上传或使用 credential extraction 兜底，缺失二进制时 target 不发布对应 capability。
 
 thieving-eyes 原生拥有队列、Attempt、Session metadata、持久事件、重试、容量和结果。Sandbox Agent 拥有当前 runtime instance 内的 Agent 进程、ACP connection 与 provider session 操作，但其内存状态不是权威存储。
 
 ## 2. 使用的上游协议面
 
-Rust runner 实现窄的 Sandbox Agent HTTP/ACP client，不把 TypeScript runtime 或 Node/Bun 引入生产执行链。官方 TypeScript SDK 用作传输语义和 conformance 参考；Rust client 必须跟随其 POST request/response、SSE 顺序、认证与关闭行为。只依赖以下上游协议面：
+Rust runner 实现窄的 Sandbox Agent HTTP/ACP client，不依赖 Sandbox Agent TypeScript SDK。Codex route 当前需要固定的 Node 22 `codex-acp` Agent process，但 Node 不承载 daemon/runner 状态或 thieving-eyes 协议。Sandbox Agent 官方 TypeScript SDK只用作传输语义和 conformance 参考；Rust client 必须跟随其 POST request/response、SSE 顺序、认证与关闭行为。只依赖以下上游协议面：
 
 - `GET /v1/health`：runtime readiness；
 - `GET /v1/agents?config=true`：Agent 安装版本和静态 capability 探测；
@@ -142,7 +142,15 @@ Sandbox Agent SSE buffer 和 SDK persist driver 都不是持久事实来源。ru
 - adapter/provider 已归类错误：对应稳定 provider error；
 - 无法归类的 Agent/provider 失败：`provider_error`。
 
-## 8. OpenCode goal 扩展
+## 8. Codex app-server binding
+
+Sandbox Agent 的 `agent=codex` ACP connection 必须解析到预置、固定 digest 的 `codex-acp`，后者以 `CODEX_PATH=/opt/thieving-eyes/bin/codex` 启动同一 sandbox 内的 Codex app-server。adapter 自带 Codex package只能用于安装期兼容检查，运行时不得覆盖管理员选定的 binary。
+
+这条路径承载普通 task 的 thread/turn/item、permission、usage、cancel 与事件映射。Codex Python SDK使用同一 app-server 协议，TypeScript SDK使用 `codex exec` JSONL；两者都不是 runner 依赖或可由 Route 选择的第二种 runtime。当前 `0.1` 只发布经过真实 smoke test 的 ephemeral task 能力，不发布 Codex session resume、structured output 或 native goal。
+
+Codex app-server 的 goal method 当前没有通过上游 ACP adapter 暴露，因此 `agent=codex` route 不能发布 `core.native_goal`。后续应优先给固定 `codex-acp` 增加窄 goal extension并做 conformance；不得绕开 Sandbox Agent 在 runner 内另写一套 app-server 生命周期。
+
+## 9. OpenCode goal 扩展
 
 普通 task 必须走上述上游 binding。修改版 OpenCode 的 goal 是唯一预先批准的窄扩展：在固定 Sandbox Agent OpenCode adapter 上增加 `session.goal.*` 与 `session.next.goal.updated` 转发，不引入平行 runtime。
 
@@ -160,7 +168,7 @@ _thieving/goal/updated       # agent -> runner notification
 
 initialize response 的 `_meta.thievingEyes.capabilities` 必须显式包含 `core.native_goal` 和 binding version，runner 还要核对预期 build digest；只配置 method 名称不能发布能力。patch 将这些 extension 映射到本机 OpenCode 的 `session.goal.*` 与 `session.next.goal.updated`，并保留原生状态和 usage，不要求 thieving-eyes 解析 Agent 文本。
 
-## 9. Conformance 必测项
+## 10. Conformance 必测项
 
 - health/agent discovery 与版本不匹配拒绝；
 - initialize、session/new、prompt、事件顺序和正常 stop reason；

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use thieving_eyes_runtime_sandbox_agent::{RuntimeEvent, RuntimeRunRequest};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, timeout};
@@ -21,8 +21,11 @@ pub struct RunnerRequest {
     pub attempt_id: String,
     pub sandbox_agent_path: PathBuf,
     pub sandbox_agent_sha256: String,
-    pub opencode_path: PathBuf,
-    pub opencode_sha256: String,
+    pub adapter: String,
+    pub agent_path: PathBuf,
+    pub agent_sha256: String,
+    pub agent_process_path: Option<PathBuf>,
+    pub agent_process_sha256: Option<String>,
     pub bubblewrap_path: PathBuf,
     pub workspace_path: Option<PathBuf>,
     pub workspace_writable: bool,
@@ -51,11 +54,13 @@ enum ControlMessage {
 
 struct SandboxPaths {
     home: PathBuf,
-    wrapper: PathBuf,
+    adapter: String,
+    agent_wrapper: Option<PathBuf>,
     runner: PathBuf,
     workspace: PathBuf,
     runtime: PathBuf,
-    opencode: PathBuf,
+    agent: PathBuf,
+    agent_process: Option<PathBuf>,
 }
 
 /// Runs one attempt through the host supervisor and forwards normalized events.
@@ -160,8 +165,19 @@ pub async fn supervisor() -> Result<()> {
         bail!("first supervisor message must be start");
     };
     let request = *request;
+    if !matches!(request.adapter.as_str(), "codex" | "opencode") {
+        bail!("unsupported Agent adapter {}", request.adapter);
+    }
     verify_file(&request.sandbox_agent_path, &request.sandbox_agent_sha256).await?;
-    verify_file(&request.opencode_path, &request.opencode_sha256).await?;
+    verify_file(&request.agent_path, &request.agent_sha256).await?;
+    match (
+        request.agent_process_path.as_deref(),
+        request.agent_process_sha256.as_deref(),
+    ) {
+        (Some(path), Some(digest)) => verify_file(path, digest).await?,
+        (None, None) => {}
+        _ => bail!("Agent process path and digest must be configured together"),
+    }
 
     let scratch = tempfile::tempdir().context("create runner scratch directory")?;
     let mut child = spawn_bubblewrap_worker(&request, &scratch).await?;
@@ -174,8 +190,13 @@ pub async fn supervisor() -> Result<()> {
                 attempt_id: request.attempt_id,
                 sandbox_agent_path: PathBuf::from("/opt/thieving-eyes/bin/sandbox-agent"),
                 sandbox_agent_sha256: request.sandbox_agent_sha256,
-                opencode_path: PathBuf::from("/opt/thieving-eyes/bin/opencode"),
-                opencode_sha256: request.opencode_sha256,
+                adapter: request.adapter.clone(),
+                agent_path: PathBuf::from(format!("/opt/thieving-eyes/bin/{}", request.adapter)),
+                agent_sha256: request.agent_sha256,
+                agent_process_path: request.agent_process_path.map(|_| {
+                    PathBuf::from(format!("/opt/thieving-eyes/bin/{}-acp", request.adapter))
+                }),
+                agent_process_sha256: request.agent_process_sha256,
                 bubblewrap_path: PathBuf::new(),
                 workspace_path: Some(PathBuf::from("/workspace")),
                 workspace_writable: request.workspace_writable,
@@ -246,6 +267,7 @@ pub async fn worker() -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let runtime_request = RuntimeRunRequest {
         sandbox_agent_path: request.sandbox_agent_path,
+        adapter: request.adapter,
         cwd: PathBuf::from("/workspace"),
         prompt: request.prompt,
         model: request.model,
@@ -350,6 +372,15 @@ async fn spawn_bubblewrap_worker(request: &RunnerRequest, scratch: &TempDir) -> 
             .arg(Path::new("/home/agent").join(&mount.sandbox_path));
     }
 
+    if request.adapter == "codex" {
+        command
+            .arg("--setenv")
+            .arg("CODEX_PATH")
+            .arg("/opt/thieving-eyes/bin/codex")
+            .arg("--setenv")
+            .arg("CODEX_HOME")
+            .arg("/home/agent/.codex");
+    }
     command
         .arg("--setenv")
         .arg("HOME")
@@ -393,17 +424,22 @@ fn is_allowed_proxy_environment(name: &str) -> bool {
 
 async fn prepare_sandbox_paths(request: &RunnerRequest, scratch: &TempDir) -> Result<SandboxPaths> {
     let home = scratch.path().join("home");
-    let wrapper = scratch.path().join("opencode");
     tokio::fs::create_dir_all(&home)
         .await
         .context("create sandbox HOME")?;
-    tokio::fs::write(
-        &wrapper,
-        b"#!/bin/sh\nexec /opt/thieving-eyes/bin/opencode-real --pure \"$@\"\n",
-    )
-    .await
-    .context("write OpenCode shim")?;
-    set_executable(&wrapper).await?;
+    let agent_wrapper = if request.adapter == "opencode" {
+        let wrapper = scratch.path().join("opencode");
+        tokio::fs::write(
+            &wrapper,
+            b"#!/bin/sh\nexec /opt/thieving-eyes/bin/opencode-real --pure \"$@\"\n",
+        )
+        .await
+        .context("write OpenCode shim")?;
+        set_executable(&wrapper).await?;
+        Some(wrapper)
+    } else {
+        None
+    };
 
     for mount in &request.credential_mounts {
         validate_sandbox_relative(&mount.sandbox_path)?;
@@ -436,11 +472,16 @@ async fn prepare_sandbox_paths(request: &RunnerRequest, scratch: &TempDir) -> Re
     };
     Ok(SandboxPaths {
         home,
-        wrapper,
+        adapter: request.adapter.clone(),
+        agent_wrapper,
         runner: std::env::current_exe().context("resolve runner binary")?,
         workspace,
         runtime: tokio::fs::canonicalize(&request.sandbox_agent_path).await?,
-        opencode: tokio::fs::canonicalize(&request.opencode_path).await?,
+        agent: tokio::fs::canonicalize(&request.agent_path).await?,
+        agent_process: match request.agent_process_path.as_deref() {
+            Some(path) => Some(tokio::fs::canonicalize(path).await?),
+            None => None,
+        },
     })
 }
 
@@ -488,16 +529,30 @@ fn configure_base_bubblewrap(command: &mut Command, paths: &SandboxPaths, networ
         .arg("/opt/thieving-eyes/bin/thieving-eyes-runner")
         .arg("--ro-bind")
         .arg(&paths.runtime)
-        .arg("/opt/thieving-eyes/bin/sandbox-agent")
-        .arg("--ro-bind")
-        .arg(&paths.opencode)
-        .arg("/opt/thieving-eyes/bin/opencode-real")
-        .arg("--ro-bind")
-        .arg(&paths.wrapper)
-        .arg("/opt/thieving-eyes/bin/opencode")
-        .arg("--bind")
-        .arg(&paths.home)
-        .arg("/home/agent");
+        .arg("/opt/thieving-eyes/bin/sandbox-agent");
+    if paths.adapter == "opencode" {
+        if let Some(wrapper) = &paths.agent_wrapper {
+            command
+                .arg("--ro-bind")
+                .arg(&paths.agent)
+                .arg("/opt/thieving-eyes/bin/opencode-real")
+                .arg("--ro-bind")
+                .arg(wrapper)
+                .arg("/opt/thieving-eyes/bin/opencode");
+        }
+    } else {
+        command
+            .arg("--ro-bind")
+            .arg(&paths.agent)
+            .arg(Path::new("/opt/thieving-eyes/bin").join(&paths.adapter));
+    }
+    if let Some(agent_process) = &paths.agent_process {
+        command
+            .arg("--ro-bind")
+            .arg(agent_process)
+            .arg(Path::new("/opt/thieving-eyes/bin").join(format!("{}-acp", paths.adapter)));
+    }
+    command.arg("--bind").arg(&paths.home).arg("/home/agent");
 }
 
 async fn write_message(stdin: &mut ChildStdin, message: &ControlMessage) -> Result<()> {
@@ -509,10 +564,22 @@ async fn write_message(stdin: &mut ChildStdin, message: &ControlMessage) -> Resu
 }
 
 async fn verify_file(path: &Path, expected: &str) -> Result<()> {
-    let bytes = tokio::fs::read(path)
+    let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("read {}", path.display()))?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", digest.finalize());
     if actual != expected {
         bail!("digest mismatch for {}", path.display());
     }
